@@ -1,0 +1,190 @@
+<?xml version="1.0"?>
+<robot name="planar3">
+  <link name="base_sphere">
+    <visual>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+      <material name="planar3_joint_blue">
+        <color rgba="0.15 0.35 0.85 1"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link1_cylinder">
+    <visual>
+      <origin xyz="0.15 0 0" rpy="0 1.5707963267948966 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.3"/>
+      </geometry>
+      <material name="planar3_link_gray">
+        <color rgba="0.42 0.46 0.52 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.075 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.15 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.225 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="planar3_joint1" type="revolute">
+    <parent link="base_sphere"/>
+    <child link="link1_cylinder"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.141592653589793" upper="3.141592653589793" effort="1" velocity="3.141592653589793"/>
+  </joint>
+
+  <link name="joint1_sphere">
+    <visual>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+      <material name="planar3_joint_blue"/>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="link1_to_joint1_sphere" type="fixed">
+    <parent link="link1_cylinder"/>
+    <child link="joint1_sphere"/>
+    <origin xyz="0.3 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="link2_cylinder">
+    <visual>
+      <origin xyz="0.15 0 0" rpy="0 1.5707963267948966 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.3"/>
+      </geometry>
+      <material name="planar3_link_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0.075 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.15 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.225 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="planar3_joint2" type="revolute">
+    <parent link="joint1_sphere"/>
+    <child link="link2_cylinder"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.141592653589793" upper="3.141592653589793" effort="1" velocity="3.141592653589793"/>
+  </joint>
+
+  <link name="joint2_sphere">
+    <visual>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+      <material name="planar3_joint_blue"/>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="link2_to_joint2_sphere" type="fixed">
+    <parent link="link2_cylinder"/>
+    <child link="joint2_sphere"/>
+    <origin xyz="0.3 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="link3_cylinder">
+    <visual>
+      <origin xyz="0.15 0 0" rpy="0 1.5707963267948966 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.3"/>
+      </geometry>
+      <material name="planar3_link_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0.075 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.15 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.225 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="planar3_joint3" type="revolute">
+    <parent link="joint2_sphere"/>
+    <child link="link3_cylinder"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.141592653589793" upper="3.141592653589793" effort="1" velocity="3.141592653589793"/>
+  </joint>
+
+  <link name="ee_sphere">
+    <visual>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+      <material name="planar3_ee_green">
+        <color rgba="0.20 0.68 0.38 1"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="0.05"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="link3_to_ee_sphere" type="fixed">
+    <parent link="link3_cylinder"/>
+    <child link="ee_sphere"/>
+    <origin xyz="0.3 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>

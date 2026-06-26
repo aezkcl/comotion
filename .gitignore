@@ -1,0 +1,12 @@
+build*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+*.pth
+*.zip
+*.diff
+
+results/
+benchmarks/results/
+comotion-results/

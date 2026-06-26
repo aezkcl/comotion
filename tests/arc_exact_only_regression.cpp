@@ -1,0 +1,555 @@
+#include "comotion/planning/ARC.h"
+#include "comotion/planning/MultiRobotProblem.h"
+#include "comotion/planning/PlanningRng.h"
+#include "comotion/planning/detail/PlannerInvariantUtils.h"
+#include "comotion/robot/FlyingSphere.h"
+
+#include <ompl/util/RandomNumbers.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace ob = ompl::base;
+
+namespace {
+
+class ArcHistoryProbe : public comotion::ARC {
+public:
+    void recordHistory(const std::vector<int> &robots, int window_start_t,
+                       int window_end_t) {
+        recordAppliedRepairHistory(robots, window_start_t, window_end_t);
+    }
+
+    std::vector<int> expandTeamWindow(int robot_i, int robot_j,
+                                      int window_start_t,
+                                      int window_end_t) const {
+        return subproblemRobotsForConflict(robot_i, robot_j, window_start_t,
+                                           window_end_t);
+    }
+
+    comotion::SubproblemConflict expandConflict(const comotion::Conflict &conflict) const {
+        return expandConflictForSubproblem(conflict);
+    }
+
+    std::vector<std::pair<int, int>> repairWindows(int robot_i,
+                                                   int robot_j) const {
+        std::vector<std::pair<int, int>> out;
+        const auto *windows = repairWindowsForRobots(robot_i, robot_j);
+        if (!windows)
+            return out;
+        for (const auto &window : *windows)
+            out.push_back({window.window_start_t, window.window_end_t});
+        return out;
+    }
+
+    void spliceRaggedLocalPaths(const std::vector<int> &robots, int start_t,
+                                int end_t,
+                                const std::vector<comotion::Path> &local_paths,
+                                std::vector<comotion::Path> &working_paths) {
+        true_arrival_timesteps_.clear();
+        true_arrival_timesteps_.reserve(working_paths.size());
+        for (const auto &path : working_paths) {
+            true_arrival_timesteps_.push_back(
+                static_cast<std::uint64_t>(path.arrival_timestep()));
+        }
+        spliceSolutionIntoPaths(robots, start_t, end_t, local_paths,
+                                working_paths);
+    }
+
+    bool solveProbeSubproblem(const comotion::SubproblemConflict &conflict,
+                              double global_time_limit,
+                              std::vector<comotion::Path> &working_paths) {
+        true_arrival_timesteps_.clear();
+        true_arrival_timesteps_.reserve(working_paths.size());
+        for (const auto &path : working_paths) {
+            true_arrival_timesteps_.push_back(
+                static_cast<std::uint64_t>(path.arrival_timestep()));
+        }
+        int window_start_t = 0;
+        int window_end_t = 0;
+        return solveSubproblemOnPaths(conflict, Clock::now(), global_time_limit,
+                                      working_paths, &window_start_t,
+                                      &window_end_t);
+    }
+};
+
+std::shared_ptr<comotion::FlyingSphere> makeSphereRobot(double radius = 1.0) {
+    return std::make_shared<comotion::FlyingSphere>(
+        radius, std::vector<double>{-12.0, -12.0, 0.0},
+        std::vector<double>{12.0, 12.0, 1.5});
+}
+
+bool expectTrue(const std::string &label, bool value) {
+    if (!value) {
+        std::cerr << "arc_exact_only_regression: " << label
+                  << " expected true\n";
+        return false;
+    }
+    return true;
+}
+
+bool expectEq(const std::string &label, std::size_t actual,
+              std::size_t expected) {
+    if (actual != expected) {
+        std::cerr << "arc_exact_only_regression: " << label
+                  << " expected " << expected << " got " << actual << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool expectGreaterThanZero(const std::string &label, std::uint64_t value) {
+    if (value == 0) {
+        std::cerr << "arc_exact_only_regression: " << label
+                  << " expected > 0\n";
+        return false;
+    }
+    return true;
+}
+
+bool expectVectorEq(const std::string &label, const std::vector<int> &actual,
+                    const std::vector<int> &expected) {
+    if (actual != expected) {
+        std::cerr << "arc_exact_only_regression: " << label << " expected [";
+        for (std::size_t i = 0; i < expected.size(); ++i)
+            std::cerr << (i ? ", " : "") << expected[i];
+        std::cerr << "] got [";
+        for (std::size_t i = 0; i < actual.size(); ++i)
+            std::cerr << (i ? ", " : "") << actual[i];
+        std::cerr << "]\n";
+        return false;
+    }
+    return true;
+}
+
+bool testSignedTimestepShiftHelpers() {
+    const auto delta =
+        comotion::detail::signedTimestepDelta(42, 30, "test negative delta");
+    if (delta != -12) {
+        std::cerr << "arc_exact_only_regression: negative delta expected -12 "
+                     "got "
+                  << delta << "\n";
+        return false;
+    }
+
+    const auto shifted =
+        comotion::detail::applySignedTimestepShift(42, delta, "test negative shift");
+    if (!expectEq("negative shift result", shifted, 30))
+        return false;
+
+    try {
+        (void)comotion::detail::applySignedTimestepShift(
+            5, -6, "test underflow");
+        std::cerr << "arc_exact_only_regression: expected runtime_error for "
+                     "negative timestep underflow\n";
+        return false;
+    } catch (const std::runtime_error &) {
+    }
+
+    return true;
+}
+
+bool testConfigMismatchInvariantThrows() {
+    try {
+        comotion::detail::requireConfigNear({0.0, 1.0}, {0.0, 2.0}, 1e-6,
+                                        "test config mismatch");
+        std::cerr << "arc_exact_only_regression: expected runtime_error for "
+                     "config mismatch invariant\n";
+        return false;
+    } catch (const std::runtime_error &) {
+    }
+
+    return true;
+}
+
+bool testRecursiveHistoryCascadeClosesTransitively() {
+    ArcHistoryProbe probe;
+    probe.recordHistory({0, 1}, 10, 20);
+    probe.recordHistory({1, 2}, 18, 30);
+
+    return expectVectorEq("recursive history closure",
+                          probe.expandTeamWindow(0, 3, 15, 19),
+                          {0, 1, 2, 3});
+}
+
+bool testHistoryCascadeIgnoresUnrelatedWindows() {
+    ArcHistoryProbe probe;
+    probe.recordHistory({0, 1}, 10, 20);
+    probe.recordHistory({1, 4}, 30, 40);
+    probe.recordHistory({3, 5}, 14, 16);
+
+    return expectVectorEq("history cascade excludes unrelated windows",
+                          probe.expandTeamWindow(0, 3, 15, 16),
+                          {0, 1, 3, 5});
+}
+
+bool testHistoryCascadeHandlesCycles() {
+    ArcHistoryProbe probe;
+    probe.recordHistory({0, 1}, 10, 20);
+    probe.recordHistory({1, 0, 2}, 10, 20);
+
+    return expectVectorEq("history cascade handles cycles",
+                          probe.expandTeamWindow(0, 3, 15, 15),
+                          {0, 1, 2, 3});
+}
+
+bool testHistoryCascadeUsesWindowIntersection() {
+    ArcHistoryProbe probe;
+    probe.setInitialWindow(10);
+    probe.recordHistory({0, 1}, 10, 20);
+
+    const auto expanded = probe.expandConflict(comotion::Conflict{0, 3, 25});
+    if (!expectVectorEq("window intersection expansion", expanded.robots,
+                        {0, 1, 3}))
+        return false;
+    return expectTrue("window intersection keeps proposed patch window",
+                      expanded.window_begin_t == 15 &&
+                          expanded.window_end_t == 35);
+}
+
+bool testRepairWindowScheduleMergesOverlaps() {
+    ArcHistoryProbe probe;
+    probe.recordHistory({0, 1}, 10, 20);
+    probe.recordHistory({0, 1}, 15, 30);
+    probe.recordHistory({0, 1}, 40, 45);
+
+    const auto windows = probe.repairWindows(0, 1);
+    if (!expectTrue("merged window count", windows.size() == 2))
+        return false;
+    if (!expectTrue("first merged window",
+                    windows[0].first == 10 && windows[0].second == 30))
+        return false;
+    return expectTrue("second non-overlap window",
+                      windows[1].first == 40 && windows[1].second == 45);
+}
+
+std::shared_ptr<comotion::MultiRobotProblem> makeArcApproximateRepairProblem() {
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(128);
+    problem->setVmax(2.0);
+    problem->setObstacles({comotion::ObstacleSphere{{0.0, 0.0, 0.75}, 1.5}});
+
+    const std::vector<std::vector<double>> starts = {
+        {10.0, 0.0, 0.75},
+        {7.07, 7.07, 0.75},
+        {0.0, 10.0, 0.75},
+        {-7.07, 7.07, 0.75},
+        {-10.0, 0.0, 0.75},
+        {-7.07, -7.07, 0.75},
+        {0.0, -10.0, 0.75},
+        {7.07, -7.07, 0.75},
+    };
+    const std::vector<std::vector<double>> goals = {
+        {-10.0, 0.0, 0.75},
+        {-7.07, -7.07, 0.75},
+        {0.0, -10.0, 0.75},
+        {7.07, -7.07, 0.75},
+        {10.0, 0.0, 0.75},
+        {7.07, 7.07, 0.75},
+        {0.0, 10.0, 0.75},
+        {-7.07, 7.07, 0.75},
+    };
+
+    for (size_t i = 0; i < starts.size(); ++i)
+        problem->addRobot(makeSphereRobot(), starts[i], goals[i]);
+
+    return problem;
+}
+
+bool testArcRejectsApproximateLocalRepairWithoutSplicing() {
+    // Match composite_rrt_approximate_regression seed mapping (OMPL root 7).
+    comotion::seedOmplGlobalFromUserPlanningSeed(6);
+
+    auto problem = makeArcApproximateRepairProblem();
+    comotion::ARC planner;
+    planner.setPlanningSeed(6);
+    planner.setProblem(problem);
+    planner.setInitialWindow(2000);
+    planner.setExpansionStep(2000);
+    planner.setUseCspaceBounds(true);
+    planner.setCspaceBoundMargin(2.0f);
+    planner.setMinCspaceBoundRange(2.0);
+
+    // Tight global wall budget so the first local CompositeRRT call (which gets
+    // the full remaining time) is in the same ~0.5s regime as
+    // composite_rrt_approximate_rejection, producing an approximate solution that
+    // CompositeRRT rejects without ARC splicing.
+    constexpr double kTightArcGlobalBudgetSec = 0.32;
+    const auto status = planner.solve(kTightArcGlobalBudgetSec);
+
+    if (status != ob::PlannerStatus::TIMEOUT &&
+        status != ob::PlannerStatus::EXACT_SOLUTION) {
+        std::cerr << "arc_exact_only_regression: expected ARC exact solution "
+                     "or timeout, got "
+                  << status.asString() << "\n";
+        return false;
+    }
+
+    return true;
+}
+
+bool testArcSolutionMetricsUsePreEqualizationCosts() {
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(32);
+    problem->setVmax(2.0);
+
+    problem->addRobot(makeSphereRobot(0.5), {-6.0, -6.0, 0.75},
+                      {-2.0, -6.0, 0.75});
+    problem->addRobot(makeSphereRobot(0.5), {6.0, 6.0, 0.75},
+                      {6.0, -6.0, 0.75});
+
+    comotion::ARC planner;
+    planner.setProblem(problem);
+    planner.setPlanningSeed(11);
+    planner.setInitialWindow(16);
+    planner.setExpansionStep(16);
+    comotion::PathSimplificationOptions simplification_options;
+    simplification_options.max_shortcut_steps = 4;
+    simplification_options.max_empty_steps = 2;
+    simplification_options.max_smooth_steps = 1;
+    planner.setPathSimplificationOptions(simplification_options);
+
+    comotion::seedOmplGlobalFromUserPlanningSeed(11);
+    const auto status = planner.solve(5.0);
+    if (status != ob::PlannerStatus::EXACT_SOLUTION) {
+        std::cerr << "arc_exact_only_regression: expected exact ARC solution "
+                     "for solution-metrics test, got "
+                  << status.asString() << "\n";
+        return false;
+    }
+
+    if (!expectTrue("ARC sum_of_cost metric populated",
+                    planner.sumOfCostTimesteps().has_value()))
+        return false;
+    if (!expectTrue("ARC makespan metric populated",
+                    planner.makespanTimesteps().has_value()))
+        return false;
+
+    const auto paths = planner.getSolutionPaths();
+    std::uint64_t equalized_sum = 0;
+    std::uint64_t equalized_makespan = 0;
+    for (const auto &path : paths) {
+        if (!expectTrue("ARC returned path has timesteps", path.has_timesteps()))
+            return false;
+        const auto arrival_timestep =
+            static_cast<std::uint64_t>(path.arrival_timestep());
+        equalized_sum += arrival_timestep;
+        equalized_makespan = std::max(equalized_makespan, arrival_timestep);
+    }
+
+    if (!expectTrue("ARC pre-equalization sum_of_cost is lower than equalized sum",
+                    *planner.sumOfCostTimesteps() < equalized_sum))
+        return false;
+    if (!expectTrue("ARC makespan matches equalized makespan",
+                    *planner.makespanTimesteps() == equalized_makespan))
+        return false;
+
+    const auto &planner_stats = planner.plannerStatsJson();
+    if (!expectTrue("ARC planner stats include num_conflicts",
+                    planner_stats.contains("num_conflicts")))
+        return false;
+    if (!expectTrue("ARC planner stats include num_subproblem_attempts",
+                    planner_stats.contains("num_subproblem_attempts")))
+        return false;
+    if (!expectTrue("ARC planner stats report zero conflicts for disjoint paths",
+                    planner_stats["num_conflicts"].get<std::uint64_t>() == 0))
+        return false;
+    if (!expectTrue("ARC planner stats include path_simplification",
+                    planner_stats.contains("path_simplification")))
+        return false;
+    const auto &path_simplification = planner_stats["path_simplification"];
+    if (!expectTrue("ARC initial simplification enabled by default",
+                    path_simplification["initial_enabled"].get<bool>()))
+        return false;
+    if (!expectTrue("ARC conflict simplification disabled by default",
+                    !path_simplification["conflict_enabled"].get<bool>()))
+        return false;
+    if (!expectTrue("ARC simplification max shortcut steps reported",
+                    path_simplification["max_shortcut_steps"]
+                            .get<unsigned int>() == 4))
+        return false;
+    if (!expectTrue("ARC simplification max empty steps reported",
+                    path_simplification["max_empty_steps"].get<unsigned int>() ==
+                        2))
+        return false;
+    if (!expectTrue("ARC simplification time reported",
+                    planner_stats.contains(
+                        "initial_simplification_times_seconds_wall_clock") &&
+                        planner_stats
+                            ["initial_simplification_times_seconds_wall_clock"]
+                                .get<double>() >= 0.0))
+        return false;
+
+    return true;
+}
+
+comotion::Path makeTimedLinePath(double y, std::size_t count) {
+    comotion::Path path;
+    for (std::size_t t = 0; t < count; ++t) {
+        path.push_back({static_cast<double>(t), y, 0.75});
+    }
+    path.markDenseTimestepsImplicit();
+    return path;
+}
+
+bool testArcSplicesRaggedLocalPathsWithoutEqualizing() {
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(1);
+    problem->setVmax(100.0);
+    problem->addRobot(makeSphereRobot(0.1), {0.0, 0.0, 0.75},
+                      {10.0, 0.0, 0.75});
+    problem->addRobot(makeSphereRobot(0.1), {0.0, 5.0, 0.75},
+                      {10.0, 5.0, 0.75});
+
+    std::vector<comotion::Path> working_paths = {
+        makeTimedLinePath(0.0, 11),
+        makeTimedLinePath(5.0, 11),
+    };
+
+    comotion::Path short_local;
+    short_local.push_back({2.0, 0.0, 0.75});
+    short_local.push_back({4.0, 0.0, 0.75});
+    short_local.push_back({6.0, 0.0, 0.75});
+    short_local.waypoint_timesteps_ = {0, 1, 2};
+
+    comotion::Path long_local;
+    long_local.push_back({2.0, 5.0, 0.75});
+    long_local.push_back({3.0, 5.0, 0.75});
+    long_local.push_back({4.0, 5.0, 0.75});
+    long_local.push_back({5.0, 5.0, 0.75});
+    long_local.push_back({6.0, 5.0, 0.75});
+    long_local.waypoint_timesteps_ = {0, 1, 2, 3, 4};
+
+    if (!expectTrue("test local paths are ragged before splice",
+                    short_local.size() != long_local.size())) {
+        return false;
+    }
+
+    ArcHistoryProbe probe;
+    probe.setProblem(problem);
+    probe.spliceRaggedLocalPaths({0, 1}, 2, 6, {short_local, long_local},
+                                 working_paths);
+
+    if (!expectTrue("short local path shifts robot 0 arrival earlier",
+                    working_paths[0].arrival_timestep() == 8)) {
+        return false;
+    }
+    if (!expectTrue("long local path preserves robot 1 arrival",
+                    working_paths[1].arrival_timestep() == 10)) {
+        return false;
+    }
+    if (!expectTrue("in-place splice keeps dense robot 0 timesteps implicit",
+                    working_paths[0].has_implicit_dense_timesteps()))
+        return false;
+    if (!expectTrue("in-place splice keeps dense robot 1 timesteps implicit",
+                    working_paths[1].has_implicit_dense_timesteps()))
+        return false;
+    return expectTrue("ragged local splice keeps different global arrivals",
+                      working_paths[0].arrival_timestep() !=
+                          working_paths[1].arrival_timestep());
+}
+
+std::shared_ptr<comotion::MultiRobotProblem> makeArcLocalModeProblem() {
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(1);
+    problem->setVmax(1.0);
+    problem->addRobot(makeSphereRobot(0.1), {0.0, 0.0, 0.75},
+                      {10.0, 0.0, 0.75});
+    return problem;
+}
+
+comotion::SubproblemConflict makeSingleRobotFullWindowConflict() {
+    comotion::SubproblemConflict conflict;
+    conflict.seed_robot_i = 0;
+    conflict.seed_robot_j = 0;
+    conflict.conflict_timestep = 0;
+    conflict.window_begin_t = 0;
+    conflict.window_end_t = 1;
+    conflict.robots = {0};
+    return conflict;
+}
+
+bool runLocalModeProbe(comotion::ARC::LocalSolverMode mode, bool &success) {
+    auto problem = makeArcLocalModeProblem();
+    std::vector<comotion::Path> working_paths;
+    comotion::Path path;
+    path.push_back(problem->robot(0).start);
+    path.push_back(problem->robot(0).goal);
+    path.waypoint_timesteps_ = {0, 1};
+    working_paths.push_back(path);
+
+    ArcHistoryProbe probe;
+    probe.setProblem(problem);
+    probe.setPlanningSeed(17);
+    probe.setLocalSolverMode(mode);
+    probe.setInitialWindow(1);
+    probe.setExpansionStep(1);
+    probe.setUseCspaceBounds(false);
+    probe.setStrrtSpaceTimeSpanFactor(1.0);
+    probe.setLocalPrioritizedStrrtMaxIterations(1);
+
+    success = probe.solveProbeSubproblem(makeSingleRobotFullWindowConflict(),
+                                         2.0, working_paths);
+    return true;
+}
+
+bool testArcLocalSolverModeGating() {
+    bool success = false;
+
+    runLocalModeProbe(comotion::ARC::LocalSolverMode::CompositeRrtOnly, success);
+    if (!expectTrue("composite-only local probe succeeds", success))
+        return false;
+
+    runLocalModeProbe(comotion::ARC::LocalSolverMode::PrioritizedStrrtOnly,
+                      success);
+    if (!expectTrue("prioritized-only local probe fails bounded short window",
+                    !success))
+        return false;
+
+    runLocalModeProbe(comotion::ARC::LocalSolverMode::Both, success);
+    if (!expectTrue("both-mode local probe falls back to composite", success))
+        return false;
+
+    return true;
+}
+
+} // namespace
+
+int main() {
+    if (!testSignedTimestepShiftHelpers())
+        return 1;
+    if (!testConfigMismatchInvariantThrows())
+        return 1;
+    if (!testRecursiveHistoryCascadeClosesTransitively())
+        return 1;
+    if (!testHistoryCascadeIgnoresUnrelatedWindows())
+        return 1;
+    if (!testHistoryCascadeHandlesCycles())
+        return 1;
+    if (!testHistoryCascadeUsesWindowIntersection())
+        return 1;
+    if (!testRepairWindowScheduleMergesOverlaps())
+        return 1;
+    if (!testArcRejectsApproximateLocalRepairWithoutSplicing())
+        return 1;
+    if (!testArcSolutionMetricsUsePreEqualizationCosts())
+        return 1;
+    if (!testArcSplicesRaggedLocalPathsWithoutEqualizing())
+        return 1;
+    if (!testArcLocalSolverModeGating())
+        return 1;
+
+    std::cout << "arc_exact_only_regression: OK\n";
+    return 0;
+}

@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use CoMotion, please cite the preferred citation below."
+title: "CoMotion: Coordinated Motion Planning for Multi-Robot Systems"
+version: 0.1.0
+date-released: 2026-06-26
+license: BSD-3-Clause
+authors:
+  - family-names: Motes
+    given-names: James D.
+  - family-names: Morales
+    given-names: Marco
+  - family-names: Amato
+    given-names: Nancy M.
+preferred-citation:
+  type: article
+  title: "Multi-Robot Motions in Milliseconds: Vector-Accelerated Primitives for Sampling-Based Planning"
+  authors:
+    - family-names: Motes
+      given-names: James D.
+    - family-names: Morales
+      given-names: Marco
+    - family-names: Amato
+      given-names: Nancy M.
+  journal: "arXiv preprint arXiv:2604.23960"
+  year: 2026
+references:
+  - type: article
+    title: "P-ARC: Exploiting Subproblem Independence for Parallel Multi-Robot Motion Planning"
+    authors:
+      - family-names: Motes
+        given-names: James D.
+      - family-names: Morales
+        given-names: Marco
+      - family-names: Amato
+        given-names: Nancy M.
+    year: 2026
+  - type: article
+    title: "AO-ARC: Almost-Surely Asymptotically Optimal Multi-Robot Motion Planning with ARC"
+    authors:
+      - family-names: Motes
+        given-names: James D.
+      - family-names: Morales
+        given-names: Marco
+      - family-names: Amato
+        given-names: Nancy M.
+    year: 2026

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Panda Rake Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: #ffffff; }
+    body { font-family: "Segoe UI", Tahoma, sans-serif; color: #1f2933; }
+    #toolbar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 10;
+      padding: 12px 16px; background: rgba(255,255,255,0.95);
+      border-bottom: 1px solid #d7dde4;
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      backdrop-filter: blur(8px);
+    }
+    #toolbar label {
+      cursor: pointer; padding: 7px 12px; border-radius: 8px;
+      background: #0f766e; color: #fff; font-size: 14px; font-weight: 600;
+    }
+    #toolbar label:hover { background: #0b5f58; }
+    #toolbar input[type="file"] { display: none; }
+    #toolbar button {
+      padding: 7px 12px; border: none; border-radius: 8px; cursor: pointer;
+      font-size: 14px; font-weight: 600; color: #fff; background: #2563eb;
+    }
+    #toolbar button:hover:not(:disabled) { background: #1d4ed8; }
+    #toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #rake-slider { min-width: 160px; max-width: 320px; flex: 1; }
+    .readout { font-size: 13px; font-weight: 600; white-space: nowrap; }
+    .muted { color: #52606d; font-weight: 500; }
+    #canvas-container { position: fixed; inset: 0; background: #ffffff; }
+    #help {
+      position: fixed; bottom: 14px; left: 14px; z-index: 10;
+      padding: 9px 12px; border-radius: 10px;
+      background: rgba(255,255,255,0.9); border: 1px solid #d7dde4;
+      font-size: 12px; color: #52606d; line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <label for="file-input">Load JSON</label>
+    <input type="file" id="file-input" accept=".json" />
+    <button type="button" id="play-pause">Play</button>
+    <span id="rake-readout" class="readout">Rake 0 / 0</span>
+    <span id="range-readout" class="readout muted">Timesteps 0, 8, 16, 24</span>
+    <span id="simd-readout" class="readout muted">Runtime SIMD 0 | Display lanes 0</span>
+    <input type="range" id="rake-slider" min="0" max="0" value="0" />
+  </div>
+  <div id="canvas-container"></div>
+  <div id="help">
+    Left/Right: previous/next rake | Home/End: first/last rake | Space: play/pause
+    <br />Camera: left-drag tumble · middle zoom · right pan
+  </div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/": "https://cdn.jsdelivr.net/npm/three@0.160.0/"
+    }
+  }
+  </script>
+  <script type="module" src="js/panda-rake.js?v=4"></script>
+</body>
+</html>

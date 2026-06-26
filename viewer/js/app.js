@@ -1,0 +1,1811 @@
+/**
+ * CoMotion path visualization viewer.
+ * Three.js-based timestep-by-timestep path playback.
+ */
+
+import * as THREE from "three";
+import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
+import { parseResult, configAt } from "./schema.js";
+import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=2";
+
+// Panda 7-DOF joint names (matches planner config order)
+const PANDA_JOINT_NAMES = [
+  "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
+  "panda_joint5", "panda_joint6", "panda_joint7",
+];
+
+// State
+let scene, camera, renderer, controls;
+let ambientLight = null;
+let sunLight = null;
+/** When true: dim ambient + directional sun (shadows). When false: bright ambient, sun off. */
+let lightingKeyMode = true;
+/** When true: URDF robots show collision primitives; when false: visual meshes only. */
+let showRobotCollisionGeometry = false;
+/** When true: hide 3D geometry and render a flat z=0 cross-section. */
+let showCrossSection2D = false;
+let resultData = null;
+let currentTimestep = 0;
+let robotMeshes = [];
+let obstacleMeshes = [];
+let crossSection2DGroup = null;
+let isPlaying = false;
+let playIntervalId = null;
+const PLAY_FPS = 12;
+const CROSS_SECTION_Z = 0;
+const CROSS_SECTION_EPS = 1e-6;
+const PLANAR3_LINK_LENGTH = 0.3;
+const PLANAR3_LINK_RADIUS = 0.05;
+
+function scaleRgbHex(hex, k) {
+  const r = Math.round(((hex >> 16) & 0xff) * k);
+  const g = Math.round(((hex >> 8) & 0xff) * k);
+  const b = Math.round((hex & 0xff) * k);
+  return (r << 16) | (g << 8) | b;
+}
+
+/** Prior light gray, darkened 20% (RGB scale 0.8). */
+const OBSTACLE_COLOR = scaleRgbHex(0xd4d4d4, 0.8);
+
+/** One saturated color per robot (URDF + placeholders). */
+function randomRobotColorHex() {
+  const h = Math.random();
+  const s = 0.52 + Math.random() * 0.35;
+  const l = 0.4 + Math.random() * 0.22;
+  return new THREE.Color().setHSL(h, s, l).getHex();
+}
+
+function createRobotSurfaceMaterial(hex) {
+  return new THREE.MeshLambertMaterial({
+    color: hex,
+    vertexColors: false,
+    transparent: false,
+    opacity: 1,
+    depthWrite: true,
+    side: THREE.DoubleSide,
+  });
+}
+
+// DOM refs
+let timestepEl, playPauseBtn, sliderEl;
+let cameraPanelEl = null;
+
+function fmtNum(v, digits = 4) {
+  if (!Number.isFinite(v)) return "";
+  const s = v.toFixed(digits);
+  return s.replace(/\.?0+$/, "") || "0";
+}
+
+function parseInput(id, fallback = 0) {
+  const el = document.getElementById(id);
+  if (!el) return fallback;
+  const v = parseFloat(String(el.value).trim());
+  return Number.isFinite(v) ? v : fallback;
+}
+
+function syncCameraInputsFromOrbit() {
+  if (!camera || !controls || !cameraPanelEl) return;
+  if (cameraPanelEl.contains(document.activeElement)) return;
+
+  const p = camera.position;
+  const t = controls.target;
+  const tx = document.getElementById("cam-tx");
+  const ty = document.getElementById("cam-ty");
+  const tz = document.getElementById("cam-tz");
+  const px = document.getElementById("cam-px");
+  const py = document.getElementById("cam-py");
+  const pz = document.getElementById("cam-pz");
+  const az = document.getElementById("cam-az");
+  const pol = document.getElementById("cam-pol");
+  const rEl = document.getElementById("cam-r");
+  if (!tx || !px || !az || !rEl) return;
+
+  tx.value = fmtNum(t.x);
+  ty.value = fmtNum(t.y);
+  tz.value = fmtNum(t.z);
+  px.value = fmtNum(p.x);
+  py.value = fmtNum(p.y);
+  pz.value = fmtNum(p.z);
+
+  const offset = new THREE.Vector3().subVectors(p, t);
+  const sph = new THREE.Spherical().setFromVector3(offset);
+  const azDeg = THREE.MathUtils.radToDeg(sph.theta);
+  az.value = fmtNum(THREE.MathUtils.euclideanModulo(azDeg, 360), 2);
+  pol.value = fmtNum(THREE.MathUtils.radToDeg(sph.phi), 2);
+  rEl.value = fmtNum(sph.radius, 4);
+}
+
+function applyCameraFromInputs() {
+  if (!camera || !controls) return;
+
+  const tx = parseInput("cam-tx", 0);
+  const ty = parseInput("cam-ty", 0);
+  const tz = parseInput("cam-tz", 0);
+  controls.target.set(tx, ty, tz);
+
+  const rEl = document.getElementById("cam-r");
+  const rStr = rEl ? String(rEl.value).trim() : "";
+  const r = rStr === "" ? NaN : parseFloat(rStr);
+
+  if (Number.isFinite(r) && r > 0) {
+    const azDeg = parseInput("cam-az", NaN);
+    const polDeg = parseInput("cam-pol", NaN);
+    if (Number.isFinite(azDeg) && Number.isFinite(polDeg)) {
+      const azRad = THREE.MathUtils.degToRad(
+        THREE.MathUtils.euclideanModulo(azDeg, 360)
+      );
+      const sph = new THREE.Spherical(
+        r,
+        THREE.MathUtils.degToRad(polDeg),
+        azRad
+      );
+      const offset = new THREE.Vector3().setFromSpherical(sph);
+      camera.position.copy(controls.target).add(offset);
+    } else {
+      camera.position.set(
+        parseInput("cam-px", 2),
+        parseInput("cam-py", 2),
+        parseInput("cam-pz", 2)
+      );
+    }
+  } else {
+    camera.position.set(
+      parseInput("cam-px", 2),
+      parseInput("cam-py", 2),
+      parseInput("cam-pz", 2)
+    );
+  }
+
+  camera.lookAt(controls.target);
+  controls.update();
+}
+
+function obstacleWorldCenter(obs) {
+  const p = obs.pose?.position;
+  if (p && p.length >= 3) return new THREE.Vector3(p[0], p[1], p[2]);
+  return null;
+}
+
+function expandByPoint(min, max, point) {
+  min.min(point);
+  max.max(point);
+}
+
+function expandByRadius(min, max, center, radius) {
+  const r = Number.isFinite(radius) ? radius : 0;
+  min.min(new THREE.Vector3(center.x - r, center.y - r, center.z - r));
+  max.max(new THREE.Vector3(center.x + r, center.y + r, center.z + r));
+}
+
+function expandObstacleBounds(min, max, obs) {
+  const center = obstacleWorldCenter(obs);
+  if (!center) return;
+  if (obs.type === "sphere") {
+    expandByRadius(min, max, center, obs.geometry?.radius ?? 0);
+    return;
+  }
+  if (obs.type === "cylinder") {
+    const radius = obs.geometry?.radius ?? 0;
+    const halfHeight = obs.geometry?.half_height ?? 0;
+    const axis = obs.pose?.axis || [0, 1, 0];
+    const axisVec = new THREE.Vector3(axis[0], axis[1], axis[2]);
+    if (axisVec.lengthSq() > 1e-12) axisVec.normalize();
+    else axisVec.set(0, 1, 0);
+    const offset = axisVec.multiplyScalar(halfHeight);
+    expandByRadius(min, max, center.clone().sub(offset), radius);
+    expandByRadius(min, max, center.clone().add(offset), radius);
+    return;
+  }
+  expandByPoint(min, max, center);
+}
+
+function computeResultBounds(data) {
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  let count = 0;
+  const expand = (point) => {
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y) || !Number.isFinite(point.z)) {
+      return;
+    }
+    expandByPoint(min, max, point);
+    count++;
+  };
+
+  for (const obs of data.obstacles || []) {
+    const before = count;
+    expandObstacleBounds(min, max, obs);
+    if (count === before && obstacleWorldCenter(obs)) count++;
+  }
+
+  for (const robot of data.robots || []) {
+    if (robot.robot_type === "sphere") {
+      for (const cfg of robot.path || []) {
+        if (cfg && cfg.length >= 3) expand(new THREE.Vector3(cfg[0], cfg[1], cfg[2]));
+      }
+    }
+    const bp = robot.base_pose?.position;
+    if (bp && bp.length >= 3) expand(new THREE.Vector3(bp[0], bp[1], bp[2]));
+  }
+
+  if (count === 0) return null;
+  return { min, max };
+}
+
+function isMobileRobot2DResult(data) {
+  const context = data.benchmark?.context;
+  if (context?.suite === "mobile_robot_2d_crossing") return true;
+  return (data.robots || []).length > 0 &&
+    data.robots.every((robot) => robot.robot_type === "sphere");
+}
+
+function isPlanarTopDownResult(data) {
+  const context = data.benchmark?.context;
+  if (context?.suite === "planar_manipulator_cross") return true;
+
+  const robots = data.robots || [];
+  return robots.length > 0 && robots.every(isPlanar3Robot);
+}
+
+function isPlanar3Robot(robot) {
+  const type = String(robot.robot_type || "").toLowerCase();
+  const urdfPath = String(
+    robot.visual_urdf_path || robot.urdf_path || robot.collision_urdf_path || ""
+  ).toLowerCase();
+  return type === "planar3" || urdfPath.includes("planar3");
+}
+
+/**
+ * True when obstacles match the fixed 1×2×1 panda cage (12 corner edge cylinders).
+ */
+function isStandardPandaCageObstacles(obstacles) {
+  if (!obstacles || obstacles.length < 12) return false;
+  const eps = 0.08;
+  const has = (x, y, z) =>
+    obstacles.some((o) => {
+      if (o.type !== "cylinder") return false;
+      const c = obstacleWorldCenter(o);
+      if (!c) return false;
+      return (
+        Math.abs(c.x - x) < eps &&
+        Math.abs(c.y - y) < eps &&
+        Math.abs(c.z - z) < eps
+      );
+    });
+  return (
+    has(-0.5, -1, 0) &&
+    has(0.5, -1, 0) &&
+    has(-0.5, 1, 0) &&
+    has(0.5, 1, 0) &&
+    has(0, -1, -0.5) &&
+    has(0, 1, 0.5)
+  );
+}
+
+/**
+ * Face the robot side of the standard cage with the long (Y) axis horizontal on screen.
+ * Uses world +Z as camera up so +Y maps to screen left–right.
+ */
+function applyStandardPandaCageCamera(data) {
+  if (!camera || !controls || !isStandardPandaCageObstacles(data.obstacles)) return false;
+
+  const min = new THREE.Vector3(Infinity, Infinity, Infinity);
+  const max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  const expand = (v) => {
+    min.min(v);
+    max.max(v);
+  };
+
+  for (const obs of data.obstacles) {
+    const c = obstacleWorldCenter(obs);
+    if (c) expand(c);
+  }
+  for (const robot of data.robots) {
+    const bp = robot.base_pose?.position;
+    if (bp && bp.length >= 3) expand(new THREE.Vector3(bp[0], bp[1], bp[2]));
+  }
+
+  const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
+  const size = new THREE.Vector3().subVectors(max, min);
+  const span = Math.max(size.x, size.y, size.z, 0.5);
+
+  let nNeg = 0;
+  let nPos = 0;
+  for (const robot of data.robots) {
+    const bp = robot.base_pose?.position;
+    if (!bp || bp.length < 3) continue;
+    if (bp[0] < -0.2) nNeg++;
+    else if (bp[0] > 0.2) nPos++;
+  }
+  const eyeSign = nPos > nNeg ? -1 : 1;
+
+  const dist = Math.max(2.4, span * 1.35);
+  camera.up.set(0, 0, 1);
+  controls.target.copy(center);
+  camera.position.set(center.x + eyeSign * dist, center.y, center.z + 0.08);
+  camera.lookAt(controls.target);
+  controls.update();
+
+  if (typeof controls.target0 !== "undefined") {
+    controls.target0.copy(controls.target);
+    controls.position0.copy(camera.position);
+    controls.up0.copy(camera.up);
+  }
+  syncCameraInputsFromOrbit();
+  return true;
+}
+
+function updateCameraClipAndShadow(span, dist) {
+  camera.near = Math.max(0.01, dist / 1000);
+  camera.far = Math.max(100, dist + span * 4);
+  camera.updateProjectionMatrix();
+  if (sunLight?.shadow?.camera) {
+    const sc = sunLight.shadow.camera;
+    const half = Math.max(10, span * 0.75);
+    sc.left = -half;
+    sc.right = half;
+    sc.top = half;
+    sc.bottom = -half;
+    sc.far = Math.max(220, dist + span * 4);
+    sc.updateProjectionMatrix();
+  }
+}
+
+function applyFittedResultCamera(data) {
+  if (!camera || !controls) return;
+  const bounds = computeResultBounds(data);
+  if (!bounds) return;
+
+  const center = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
+  const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
+  const span = Math.max(size.x, size.y, size.z, 1);
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const aspect = Math.max(camera.aspect || 1, 1e-6);
+
+  if (isMobileRobot2DResult(data) || isPlanarTopDownResult(data)) {
+    const fitY = Math.max(size.y, 1) / (2 * Math.tan(fov / 2));
+    const fitX = Math.max(size.x, 1) / (2 * Math.tan(fov / 2) * aspect);
+    const dist = Math.max(8, Math.max(fitX, fitY) * 1.2);
+    // Top-down XY view: world +X stays horizontal, world +Y stays vertical.
+    camera.up.set(0, 1, 0);
+    controls.target.copy(center);
+    camera.position.set(center.x, center.y, center.z + dist);
+    camera.lookAt(controls.target);
+    updateCameraClipAndShadow(span, dist);
+  } else {
+    const dir = new THREE.Vector3(1, -1, 0.7).normalize();
+    const dist = Math.max(2.4, span * 1.8);
+    camera.up.set(0, 0, 1);
+    controls.target.copy(center);
+    camera.position.copy(center).addScaledVector(dir, dist);
+    camera.lookAt(controls.target);
+    updateCameraClipAndShadow(span, dist);
+  }
+
+  controls.update();
+  if (typeof controls.target0 !== "undefined") {
+    controls.target0.copy(controls.target);
+    controls.position0.copy(camera.position);
+    controls.up0.copy(camera.up);
+  }
+  syncCameraInputsFromOrbit();
+}
+
+function applyTopDownCameraToBounds(bounds) {
+  if (!camera || !controls || !bounds) return;
+  const center = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
+  const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
+  const fov = THREE.MathUtils.degToRad(camera.fov);
+  const aspect = Math.max(camera.aspect || 1, 1e-6);
+  const fitY = Math.max(size.y, 1) / (2 * Math.tan(fov / 2));
+  const fitX = Math.max(size.x, 1) / (2 * Math.tan(fov / 2) * aspect);
+  const span = Math.max(size.x, size.y, 1);
+  const dist = Math.max(8, Math.max(fitX, fitY) * 1.22);
+
+  camera.up.set(0, 1, 0);
+  controls.target.set(center.x, center.y, CROSS_SECTION_Z);
+  camera.position.set(center.x, center.y, CROSS_SECTION_Z + dist);
+  camera.lookAt(controls.target);
+  updateCameraClipAndShadow(span, dist);
+  controls.update();
+
+  if (typeof controls.target0 !== "undefined") {
+    controls.target0.copy(controls.target);
+    controls.position0.copy(camera.position);
+    controls.up0.copy(camera.up);
+  }
+  syncCameraInputsFromOrbit();
+}
+
+function applyCrossSectionCamera() {
+  if (!resultData) return;
+  let bounds = null;
+  if (crossSection2DGroup && crossSection2DGroup.children.length > 0) {
+    crossSection2DGroup.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(crossSection2DGroup);
+    if (!box.isEmpty()) bounds = { min: box.min, max: box.max };
+  }
+  applyTopDownCameraToBounds(bounds || computeResultBounds(resultData));
+}
+
+function applyResultCamera(data) {
+  if (!applyStandardPandaCageCamera(data)) {
+    applyFittedResultCamera(data);
+  }
+}
+
+function initCameraPanel() {
+  cameraPanelEl = document.getElementById("camera-panel");
+  const applyBtn = document.getElementById("camera-apply");
+  if (!cameraPanelEl || !applyBtn) return;
+
+  applyBtn.addEventListener("click", () => {
+    applyCameraFromInputs();
+    syncCameraInputsFromOrbit();
+  });
+
+  cameraPanelEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target instanceof HTMLInputElement) {
+      e.preventDefault();
+      applyCameraFromInputs();
+      syncCameraInputsFromOrbit();
+    }
+  });
+}
+
+/**
+ * Create a pose matrix from position and quaternion_xyzw.
+ */
+function poseToMatrix(pose) {
+  const pos = pose.position || [0, 0, 0];
+  const q = pose.quaternion_xyzw || [0, 0, 0, 1];
+  const m = new THREE.Matrix4();
+  m.compose(
+    new THREE.Vector3(pos[0], pos[1], pos[2]),
+    new THREE.Quaternion(q[0], q[1], q[2], q[3]),
+    new THREE.Vector3(1, 1, 1)
+  );
+  return m;
+}
+
+/**
+ * Build obstacle meshes from result data.
+ */
+function buildObstacles(data) {
+  const group = new THREE.Group();
+  const obstacleMat = new THREE.MeshLambertMaterial({ color: OBSTACLE_COLOR, side: THREE.DoubleSide });
+  let sphereCount = 0;
+  let cylinderCount = 0;
+
+  const types = data.obstacles.map((o) => o.type || "?");
+  console.log("[viewer] buildObstacles:", data.obstacles.length, "obstacles, types:", types);
+
+  data.obstacles.forEach((obs) => {
+    if (obs.type === "sphere") {
+      const r = obs.geometry?.radius ?? 0.2;
+      const geom = new THREE.SphereGeometry(r, 24, 24);
+      const mesh = new THREE.Mesh(geom, obstacleMat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      const m = poseToMatrix(obs.pose || {});
+      mesh.applyMatrix4(m);
+      group.add(mesh);
+      sphereCount++;
+    } else if (obs.type === "cylinder") {
+      const r = Math.max(obs.geometry?.radius ?? 0.1, 0.06);
+      const halfHeight = obs.geometry?.half_height ?? 0.5;
+      const height = 2 * halfHeight;
+      const geom = new THREE.CylinderGeometry(r, r, height, 24);
+      const mesh = new THREE.Mesh(geom, obstacleMat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      const pos = obs.pose?.position || [0, 0, 0];
+      const axis = obs.pose?.axis || [0, 1, 0];
+      mesh.position.set(pos[0], pos[1], pos[2]);
+      const axisVec = new THREE.Vector3(axis[0], axis[1], axis[2]);
+      const len = axisVec.length();
+      if (len > 1e-6) {
+        axisVec.normalize();
+        const defaultY = new THREE.Vector3(0, 1, 0);
+        const dot = defaultY.dot(axisVec);
+        const quat = new THREE.Quaternion();
+        if (dot < -0.9999) {
+          quat.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+        } else {
+          quat.setFromUnitVectors(defaultY, axisVec);
+        }
+        mesh.applyQuaternion(quat);
+      }
+      group.add(mesh);
+      cylinderCount++;
+    }
+  });
+
+  if (sphereCount > 0 || cylinderCount > 0) {
+    console.log(`Built ${data.obstacles.length} obstacles (${sphereCount} spheres, ${cylinderCount} cylinders)`);
+  }
+  return group;
+}
+
+function asFiniteNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function disposeMaterial(material) {
+  if (Array.isArray(material)) {
+    material.forEach((m) => m?.dispose?.());
+    return;
+  }
+  material?.dispose?.();
+}
+
+function disposeObjectTree(root) {
+  root.traverse((obj) => {
+    obj.geometry?.dispose?.();
+    disposeMaterial(obj.material);
+  });
+}
+
+function clearCrossSection2DGroup() {
+  if (!crossSection2DGroup) return;
+  scene?.remove(crossSection2DGroup);
+  disposeObjectTree(crossSection2DGroup);
+  crossSection2DGroup = null;
+}
+
+function createCrossSectionFillMaterial(colorHex, opacity = 0.88) {
+  return new THREE.MeshBasicMaterial({
+    color: colorHex,
+    transparent: opacity < 1,
+    opacity,
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  });
+}
+
+function createCrossSectionLineMaterial(colorHex, opacity = 0.82) {
+  return new THREE.LineBasicMaterial({
+    color: colorHex,
+    transparent: opacity < 1,
+    opacity,
+    depthTest: false,
+    depthWrite: false,
+  });
+}
+
+function addCircle2DCrossSection(
+  group,
+  center,
+  radius,
+  colorHex,
+  zOffset,
+  opacity,
+  renderOrder,
+  outlineColor = scaleRgbHex(colorHex, 0.5)
+) {
+  if (!Number.isFinite(radius) || radius <= CROSS_SECTION_EPS) return false;
+  const z = CROSS_SECTION_Z + zOffset;
+  const segments = 48;
+  const fill = new THREE.Mesh(
+    new THREE.CircleGeometry(radius, segments),
+    createCrossSectionFillMaterial(colorHex, opacity)
+  );
+  fill.position.set(center.x, center.y, z);
+  fill.renderOrder = renderOrder;
+  fill.frustumCulled = false;
+  group.add(fill);
+
+  const points = [];
+  for (let i = 0; i < segments; ++i) {
+    const a = (i / segments) * Math.PI * 2;
+    points.push(new THREE.Vector3(
+      center.x + Math.cos(a) * radius,
+      center.y + Math.sin(a) * radius,
+      z + 0.001
+    ));
+  }
+  const outline = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(points),
+    createCrossSectionLineMaterial(outlineColor)
+  );
+  outline.renderOrder = renderOrder + 1;
+  outline.frustumCulled = false;
+  group.add(outline);
+  return true;
+}
+
+function addPolygon2DCrossSection(
+  group,
+  points,
+  colorHex,
+  zOffset,
+  opacity,
+  renderOrder,
+  outlineColor = scaleRgbHex(colorHex, 0.5)
+) {
+  if (!points || points.length < 3) return false;
+  const z = CROSS_SECTION_Z + zOffset;
+  const shape = new THREE.Shape();
+  shape.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length; ++i) {
+    shape.lineTo(points[i].x, points[i].y);
+  }
+  shape.closePath();
+
+  const fill = new THREE.Mesh(
+    new THREE.ShapeGeometry(shape),
+    createCrossSectionFillMaterial(colorHex, opacity)
+  );
+  fill.position.z = z;
+  fill.renderOrder = renderOrder;
+  fill.frustumCulled = false;
+  group.add(fill);
+
+  const outlinePoints = points.map((p) => new THREE.Vector3(p.x, p.y, z + 0.001));
+  const outline = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(outlinePoints),
+    createCrossSectionLineMaterial(outlineColor)
+  );
+  outline.renderOrder = renderOrder + 1;
+  outline.frustumCulled = false;
+  group.add(outline);
+  return true;
+}
+
+function addSphereCrossSection2D(
+  group,
+  center,
+  radius,
+  colorHex,
+  zOffset,
+  opacity,
+  renderOrder,
+  outlineColor
+) {
+  const dz = center.z - CROSS_SECTION_Z;
+  if (Math.abs(dz) > radius + CROSS_SECTION_EPS) return false;
+  const sectionRadius = Math.sqrt(Math.max(0, radius * radius - dz * dz));
+  return addCircle2DCrossSection(
+    group,
+    new THREE.Vector2(center.x, center.y),
+    sectionRadius,
+    colorHex,
+    zOffset,
+    opacity,
+    renderOrder,
+    outlineColor
+  );
+}
+
+function orientedRectanglePoints(center, axis2, halfLength, halfWidth) {
+  const a = axis2.clone().normalize();
+  const p = new THREE.Vector2(-a.y, a.x);
+  const c = new THREE.Vector2(center.x, center.y);
+  return [
+    c.clone().addScaledVector(a, -halfLength).addScaledVector(p, -halfWidth),
+    c.clone().addScaledVector(a, halfLength).addScaledVector(p, -halfWidth),
+    c.clone().addScaledVector(a, halfLength).addScaledVector(p, halfWidth),
+    c.clone().addScaledVector(a, -halfLength).addScaledVector(p, halfWidth),
+  ];
+}
+
+function addCylinderCrossSection2D(
+  group,
+  center,
+  axis,
+  radius,
+  halfLength,
+  colorHex,
+  zOffset,
+  opacity,
+  renderOrder,
+  outlineColor
+) {
+  if (!Number.isFinite(radius) || radius <= CROSS_SECTION_EPS) return false;
+  const axis2 = new THREE.Vector2(axis.x, axis.y);
+  if (axis2.lengthSq() <= CROSS_SECTION_EPS) {
+    if (Math.abs(center.z - CROSS_SECTION_Z) > halfLength + CROSS_SECTION_EPS) {
+      return false;
+    }
+    return addCircle2DCrossSection(
+      group,
+      new THREE.Vector2(center.x, center.y),
+      radius,
+      colorHex,
+      zOffset,
+      opacity,
+      renderOrder,
+      outlineColor
+    );
+  }
+
+  const dz = center.z - CROSS_SECTION_Z;
+  if (Math.abs(dz) > radius + CROSS_SECTION_EPS) return false;
+  const halfWidth = Math.sqrt(Math.max(0, radius * radius - dz * dz));
+  const points = orientedRectanglePoints(center, axis2, halfLength, halfWidth);
+  return addPolygon2DCrossSection(
+    group,
+    points,
+    colorHex,
+    zOffset,
+    opacity,
+    renderOrder,
+    outlineColor
+  );
+}
+
+function addResultObstacles2DCrossSection(group, data) {
+  const outlineColor = 0x555555;
+  let count = 0;
+  for (const obs of data.obstacles || []) {
+    const center = obstacleWorldCenter(obs);
+    if (!center) continue;
+    if (obs.type === "sphere") {
+      const radius = asFiniteNumber(obs.geometry?.radius, 0.2);
+      if (addSphereCrossSection2D(
+        group,
+        center,
+        radius,
+        OBSTACLE_COLOR,
+        0,
+        0.74,
+        10,
+        outlineColor
+      )) count++;
+      continue;
+    }
+    if (obs.type === "cylinder") {
+      const axis = obs.pose?.axis || [0, 1, 0];
+      const axisVec = new THREE.Vector3(axis[0], axis[1], axis[2]);
+      if (axisVec.lengthSq() > CROSS_SECTION_EPS) axisVec.normalize();
+      else axisVec.set(0, 1, 0);
+      const radius = asFiniteNumber(obs.geometry?.radius, 0.1);
+      const halfLength = asFiniteNumber(obs.geometry?.half_height, 0.5);
+      if (addCylinderCrossSection2D(
+        group,
+        center,
+        axisVec,
+        radius,
+        halfLength,
+        OBSTACLE_COLOR,
+        0,
+        0.74,
+        10,
+        outlineColor
+      )) count++;
+    }
+  }
+  return count;
+}
+
+function geometryPrimitiveKind(geometry) {
+  if (!geometry) return "";
+  const type = String(geometry.type || "").toLowerCase();
+  const params = geometry.parameters || {};
+  if (type.includes("sphere")) return "sphere";
+  if (type.includes("cylinder")) return "cylinder";
+  if (Number.isFinite(Number(params.height))) return "cylinder";
+  if (Number.isFinite(Number(params.radius))) return "sphere";
+  return "";
+}
+
+function geometryBoundingBox(geometry) {
+  if (!geometry) return null;
+  if (!geometry.boundingBox) geometry.computeBoundingBox?.();
+  return geometry.boundingBox || null;
+}
+
+function addSphereMeshCrossSection2D(group, mesh, colorHex, zOffset, opacity, renderOrder) {
+  const box = geometryBoundingBox(mesh.geometry);
+  if (!box) return false;
+  const center = box.getCenter(new THREE.Vector3()).applyMatrix4(mesh.matrixWorld);
+  const size = box.getSize(new THREE.Vector3());
+  const localRadius = asFiniteNumber(
+    mesh.geometry.parameters?.radius,
+    Math.max(size.x, size.y, size.z) * 0.5
+  );
+  const scale = mesh.getWorldScale(new THREE.Vector3());
+  const worldRadius = localRadius * Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z), 1e-9);
+  return addSphereCrossSection2D(
+    group,
+    center,
+    worldRadius,
+    colorHex,
+    zOffset,
+    opacity,
+    renderOrder
+  );
+}
+
+function largestDimensionIndex(size) {
+  const dims = [size.x, size.y, size.z];
+  let axis = 0;
+  for (let i = 1; i < dims.length; ++i) {
+    if (dims[i] > dims[axis]) axis = i;
+  }
+  return axis;
+}
+
+function unitAxis(index) {
+  if (index === 0) return new THREE.Vector3(1, 0, 0);
+  if (index === 1) return new THREE.Vector3(0, 1, 0);
+  return new THREE.Vector3(0, 0, 1);
+}
+
+function addCylinderMeshCrossSection2D(group, mesh, colorHex, zOffset, opacity, renderOrder) {
+  const box = geometryBoundingBox(mesh.geometry);
+  if (!box) return false;
+  const size = box.getSize(new THREE.Vector3());
+  const axisIndex = largestDimensionIndex(size);
+  const dims = [size.x, size.y, size.z];
+  const localAxis = unitAxis(axisIndex);
+  const centerLocal = box.getCenter(new THREE.Vector3());
+  const halfLengthLocal = dims[axisIndex] * 0.5;
+  const start = centerLocal.clone()
+    .addScaledVector(localAxis, -halfLengthLocal)
+    .applyMatrix4(mesh.matrixWorld);
+  const end = centerLocal.clone()
+    .addScaledVector(localAxis, halfLengthLocal)
+    .applyMatrix4(mesh.matrixWorld);
+  const center = centerLocal.clone().applyMatrix4(mesh.matrixWorld);
+  const axis2 = new THREE.Vector2(end.x - start.x, end.y - start.y);
+  const halfLength = axis2.length() * 0.5;
+
+  const radialDims = dims.filter((_, i) => i !== axisIndex);
+  const localRadius = Math.max(radialDims[0] || 0, radialDims[1] || 0) * 0.5;
+  const scale = mesh.getWorldScale(new THREE.Vector3());
+  const worldRadius = localRadius * Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z), 1e-9);
+
+  if (axis2.lengthSq() <= CROSS_SECTION_EPS) {
+    const halfWorldLength = start.distanceTo(end) * 0.5;
+    return addCylinderCrossSection2D(
+      group,
+      center,
+      new THREE.Vector3(0, 0, 1),
+      worldRadius,
+      halfWorldLength,
+      colorHex,
+      zOffset,
+      opacity,
+      renderOrder
+    );
+  }
+
+  return addCylinderCrossSection2D(
+    group,
+    center,
+    new THREE.Vector3(axis2.x, axis2.y, 0),
+    worldRadius,
+    halfLength,
+    colorHex,
+    zOffset,
+    opacity,
+    renderOrder
+  );
+}
+
+function collectPrimitiveMeshesUnder(root, collisionMode) {
+  const meshes = new Set();
+  const isBranch = collisionMode ? isUrdfColliderNode : isUrdfVisualNode;
+  root.traverse((obj) => {
+    if (!isBranch(obj)) return;
+    obj.traverse((child) => {
+      if (child.isMesh && geometryPrimitiveKind(child.geometry)) {
+        meshes.add(child);
+      }
+    });
+  });
+
+  if (meshes.size === 0) {
+    root.traverse((child) => {
+      if (child.isMesh && geometryPrimitiveKind(child.geometry)) {
+        meshes.add(child);
+      }
+    });
+  }
+  return Array.from(meshes);
+}
+
+function activeUrdfRootForCrossSection(entry) {
+  if (showRobotCollisionGeometry && entry.collisionUrdfRobot) {
+    return entry.collisionUrdfRobot;
+  }
+  return entry.urdfRobot;
+}
+
+function yawFromQuaternionXYZW(q) {
+  if (!q || q.length < 4) return 0;
+  const x = asFiniteNumber(q[0], 0);
+  const y = asFiniteNumber(q[1], 0);
+  const z = asFiniteNumber(q[2], 0);
+  const w = asFiniteNumber(q[3], 1);
+  return Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+}
+
+function robotBasePose2D(robot) {
+  const pose = robot.base_pose || {};
+  const pos = pose.position || [0, 0, 0];
+  const yaw = Number.isFinite(Number(pose.yaw))
+    ? Number(pose.yaw)
+    : yawFromQuaternionXYZW(pose.quaternion_xyzw);
+  return {
+    position: new THREE.Vector2(
+      asFiniteNumber(pos[0], 0),
+      asFiniteNumber(pos[1], 0)
+    ),
+    yaw,
+  };
+}
+
+function addPlanar3CollisionCircle(group, center, colorHex) {
+  return addCircle2DCrossSection(
+    group,
+    center,
+    PLANAR3_LINK_RADIUS,
+    colorHex,
+    0.014,
+    0.9,
+    34
+  );
+}
+
+function addPlanar3RobotVisualCrossSection2D(group, entry, colorHex) {
+  const cfg = configAt(entry.robot, currentTimestep);
+  const base = robotBasePose2D(entry.robot);
+  let joint = base.position.clone();
+  let theta = base.yaw;
+  let count = 0;
+
+  addPlanar3CollisionCircle(group, joint, colorHex);
+
+  for (let i = 0; i < 3; ++i) {
+    theta += asFiniteNumber(cfg?.[i], 0);
+    const axis = new THREE.Vector2(Math.cos(theta), Math.sin(theta));
+    const center = joint.clone().addScaledVector(axis, PLANAR3_LINK_LENGTH * 0.5);
+    const points = orientedRectanglePoints(
+      center,
+      axis,
+      PLANAR3_LINK_LENGTH * 0.5,
+      PLANAR3_LINK_RADIUS
+    );
+    if (addPolygon2DCrossSection(group, points, colorHex, 0.012, 0.9, 30)) {
+      count++;
+    }
+
+    joint = joint.clone().addScaledVector(axis, PLANAR3_LINK_LENGTH);
+    addPlanar3CollisionCircle(group, joint, colorHex);
+  }
+
+  return count;
+}
+
+function addPlanar3RobotCollisionCrossSection2D(group, entry, colorHex) {
+  const cfg = configAt(entry.robot, currentTimestep);
+  const base = robotBasePose2D(entry.robot);
+  let joint = base.position.clone();
+  let theta = base.yaw;
+  let count = addPlanar3CollisionCircle(group, joint, colorHex) ? 1 : 0;
+  const collisionOffsets = [0.075, 0.15, 0.225];
+
+  for (let i = 0; i < 3; ++i) {
+    theta += asFiniteNumber(cfg?.[i], 0);
+    const axis = new THREE.Vector2(Math.cos(theta), Math.sin(theta));
+    for (const offset of collisionOffsets) {
+      const center = joint.clone().addScaledVector(axis, offset);
+      if (addPlanar3CollisionCircle(group, center, colorHex)) count++;
+    }
+    joint = joint.clone().addScaledVector(axis, PLANAR3_LINK_LENGTH);
+    if (addPlanar3CollisionCircle(group, joint, colorHex)) count++;
+  }
+
+  return count;
+}
+
+function addPlanar3RobotCrossSection2D(group, entry, colorHex) {
+  if (showRobotCollisionGeometry) {
+    return addPlanar3RobotCollisionCrossSection2D(group, entry, colorHex);
+  }
+  return addPlanar3RobotVisualCrossSection2D(group, entry, colorHex);
+}
+
+function addRobotEntry2DCrossSection(group, entry) {
+  const colorHex = entry.colorHex ?? 0x3366cc;
+  let count = 0;
+  if (isPlanar3Robot(entry.robot)) {
+    return addPlanar3RobotCrossSection2D(group, entry, colorHex);
+  }
+
+  if (entry.urdfRobot) {
+    const root = activeUrdfRootForCrossSection(entry);
+    root?.updateMatrixWorld?.(true);
+    for (const mesh of collectPrimitiveMeshesUnder(root, showRobotCollisionGeometry)) {
+      mesh.updateWorldMatrix?.(true, false);
+      const kind = geometryPrimitiveKind(mesh.geometry);
+      if (kind === "sphere") {
+        if (addSphereMeshCrossSection2D(group, mesh, colorHex, 0.012, 0.9, 30)) count++;
+      } else if (kind === "cylinder") {
+        if (addCylinderMeshCrossSection2D(group, mesh, colorHex, 0.012, 0.9, 30)) count++;
+      }
+    }
+    return count;
+  }
+
+  if (entry.mesh) {
+    entry.mesh.updateWorldMatrix?.(true, false);
+    const kind = geometryPrimitiveKind(entry.mesh.geometry);
+    if (kind === "sphere") {
+      if (addSphereMeshCrossSection2D(group, entry.mesh, colorHex, 0.012, 0.9, 30)) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+function refreshCrossSection2D() {
+  if (!scene || !resultData) return;
+  clearCrossSection2DGroup();
+  const group = new THREE.Group();
+  group.name = "z0_cross_section_2d";
+  addResultObstacles2DCrossSection(group, resultData);
+  robotMeshes.forEach((entry) => addRobotEntry2DCrossSection(group, entry));
+  group.visible = showCrossSection2D;
+  crossSection2DGroup = group;
+  scene.add(group);
+}
+
+function createRobotLineMaterial(hex) {
+  return new THREE.LineBasicMaterial({
+    color: hex,
+    transparent: false,
+    opacity: 1,
+    depthWrite: true,
+  });
+}
+
+function isUrdfVisualNode(obj) {
+  return obj.isURDFVisual === true || obj.type === "URDFVisual";
+}
+
+function isUrdfColliderNode(obj) {
+  return obj.isURDFCollider === true || obj.type === "URDFCollider";
+}
+
+/**
+ * Toggle URDF visual vs collision branches. For panda_spherized.urdf, collision is mostly
+ * sphere primitives (urdf-loader URDFCollider groups under each link, each holding a Mesh).
+ * Visuals are URDFVisual groups (OBJ/STL meshes). Visibility is set on those groups; child
+ * meshes inherit. Requires URDFLoader.parseCollision=true at load time.
+ */
+function setUrdfRobotGeometryVisibility(urdfRobot, collisionMode) {
+  urdfRobot.traverse((obj) => {
+    if (isUrdfVisualNode(obj)) obj.visible = !collisionMode;
+    if (isUrdfColliderNode(obj)) obj.visible = !!collisionMode;
+  });
+}
+
+function countUrdfColliderRoots(urdfRobot) {
+  let n = 0;
+  urdfRobot.traverse((obj) => {
+    if (isUrdfColliderNode(obj)) n++;
+  });
+  return n;
+}
+
+function applyRobotGeometryModeToScene() {
+  const show3D = !showCrossSection2D;
+  robotMeshes.forEach(({ mesh, urdfRobot, collisionUrdfRobot }) => {
+    if (mesh) mesh.visible = show3D;
+
+    if (!show3D) {
+      if (urdfRobot) urdfRobot.visible = false;
+      if (collisionUrdfRobot && collisionUrdfRobot !== urdfRobot) {
+        collisionUrdfRobot.visible = false;
+      }
+      return;
+    }
+
+    if (collisionUrdfRobot && collisionUrdfRobot !== urdfRobot) {
+      if (urdfRobot) {
+        urdfRobot.visible = !showRobotCollisionGeometry;
+        setUrdfRobotGeometryVisibility(urdfRobot, false);
+      }
+      collisionUrdfRobot.visible = showRobotCollisionGeometry;
+      setUrdfRobotGeometryVisibility(collisionUrdfRobot, true);
+      return;
+    }
+
+    if (urdfRobot) {
+      urdfRobot.visible = true;
+      setUrdfRobotGeometryVisibility(urdfRobot, showRobotCollisionGeometry);
+    }
+  });
+}
+
+function applySceneDisplayMode() {
+  const show3D = !showCrossSection2D;
+  obstacleMeshes.forEach((mesh) => {
+    mesh.visible = show3D;
+  });
+  if (crossSection2DGroup) {
+    crossSection2DGroup.visible = showCrossSection2D;
+  }
+  if (controls) {
+    controls.noRotate = showCrossSection2D;
+  }
+  applyRobotGeometryModeToScene();
+}
+
+function syncGeometryToggleButton() {
+  const btn = document.getElementById("geometry-toggle");
+  if (!btn) return;
+  btn.textContent = showRobotCollisionGeometry ? "Collision geo" : "Visual geo";
+  btn.title = showRobotCollisionGeometry
+    ? "Showing URDF collision primitives. Click for visual meshes."
+    : "Showing URDF visual meshes. Click for collision geometry.";
+}
+
+function toggleRobotGeometryMode() {
+  showRobotCollisionGeometry = !showRobotCollisionGeometry;
+  console.info(
+    `[viewer] Showing ${showRobotCollisionGeometry ? "collision" : "visual"} geometry`
+  );
+  if (showRobotCollisionGeometry) {
+    let total = 0;
+    robotMeshes.forEach(({ urdfRobot, collisionUrdfRobot }) => {
+      const root = collisionUrdfRobot || urdfRobot;
+      if (root) total += countUrdfColliderRoots(root);
+    });
+    if (total === 0) {
+      console.warn(
+        "[viewer] No URDF collision groups found (0 URDFCollider nodes). " +
+          "Reload with cache disabled or hard-refresh; ensure urdf-loader.js loads collision " +
+          "(parseCollision=true). Without <collision> geometry, only visuals exist."
+      );
+    }
+  }
+  applyRobotGeometryModeToScene();
+  if (showCrossSection2D) refreshCrossSection2D();
+  syncGeometryToggleButton();
+}
+
+function syncCrossSectionToggleButton() {
+  const btn = document.getElementById("cross-section-toggle");
+  if (!btn) return;
+  btn.disabled = !resultData;
+  btn.textContent = showCrossSection2D ? "3D view" : "2D z=0";
+  btn.title = showCrossSection2D
+    ? "Showing the z=0 cross-section. Click to restore the 3D scene."
+    : "Show a flat z=0 cross-section of spheres and cylinders.";
+}
+
+function setCrossSection2DMode(enabled) {
+  showCrossSection2D = !!enabled;
+  if (showCrossSection2D) {
+    refreshCrossSection2D();
+  }
+  applySceneDisplayMode();
+  syncCrossSectionToggleButton();
+  if (resultData) {
+    if (showCrossSection2D) applyCrossSectionCamera();
+    else applyResultCamera(resultData);
+  }
+}
+
+function toggleCrossSection2DMode() {
+  if (!resultData) return;
+  setCrossSection2DMode(!showCrossSection2D);
+}
+
+/**
+ * Replace every drawable material on a robot with a solid flat color.
+ * OBJ polylines become LineSegments with default white LineBasicMaterial unless handled here.
+ */
+function applyRobotSolidColor(root, colorHex) {
+  root.traverse((c) => {
+    if (c.isMesh) {
+      if (Array.isArray(c.material)) {
+        const oldMats = c.material;
+        oldMats.forEach((m) => m.dispose?.());
+        c.material = oldMats.map(() => createRobotSurfaceMaterial(colorHex));
+      } else {
+        c.material?.dispose?.();
+        c.material = createRobotSurfaceMaterial(colorHex);
+      }
+      c.castShadow = true;
+      c.receiveShadow = true;
+      return;
+    }
+    if (c.isLineSegments || c.isLine || c.isLineLoop) {
+      if (Array.isArray(c.material)) {
+        const oldMats = c.material;
+        oldMats.forEach((m) => m.dispose?.());
+        c.material = oldMats.map(() => createRobotLineMaterial(colorHex));
+      } else {
+        c.material?.dispose?.();
+        c.material = createRobotLineMaterial(colorHex);
+      }
+      c.castShadow = false;
+      c.receiveShadow = false;
+    }
+  });
+}
+
+/**
+ * Build placeholder robot when URDF is unavailable.
+ * For sphere robots (robot_type === "sphere"), creates a sphere with robot_radius.
+ * Otherwise creates a small box.
+ */
+function buildPlaceholderRobot(robot, colorHex) {
+  const isSphere = robot.robot_type === "sphere";
+  const radius = robot.robot_radius ?? 0.5;
+  const geom = isSphere
+    ? new THREE.SphereGeometry(radius, 24, 24)
+    : new THREE.BoxGeometry(0.15, 0.15, 0.15);
+  const mesh = new THREE.Mesh(geom, createRobotSurfaceMaterial(colorHex));
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return { mesh, robot, urdfRobot: null, colorHex };
+}
+
+/**
+ * Apply joint config to URDF robot.
+ */
+function collectUrdfJoints(urdfRobot) {
+  if (urdfRobot.userData?.jointLookup) return urdfRobot.userData.jointLookup;
+  const joints = { ...(urdfRobot.joints || {}) };
+  urdfRobot.traverse?.((obj) => {
+    if ((obj.isURDFJoint === true || obj.type === "URDFJoint") && obj.name) {
+      joints[obj.name] = obj;
+    }
+  });
+  urdfRobot.userData = urdfRobot.userData || {};
+  urdfRobot.userData.jointLookup = joints;
+  return joints;
+}
+
+function applyJointConfig(urdfRobot, robot, config) {
+  if (!config || config.length === 0) return;
+  const jointNames =
+    Array.isArray(robot.joint_names) && robot.joint_names.length > 0
+      ? robot.joint_names
+      : PANDA_JOINT_NAMES;
+  const n = Math.min(config.length, jointNames.length);
+  const values = {};
+  for (let i = 0; i < n; i++) {
+    values[jointNames[i]] = config[i];
+  }
+
+  let applied = false;
+  if (typeof urdfRobot.setJointValues === "function") {
+    try {
+      urdfRobot.setJointValues(values);
+      applied = true;
+    } catch (err) {
+      if (!robot._jointApplyWarned) {
+        console.warn("[viewer] setJointValues failed; falling back to per-joint updates", err);
+        robot._jointApplyWarned = true;
+      }
+    }
+  }
+
+  const joints = collectUrdfJoints(urdfRobot);
+  for (const [name, value] of Object.entries(values)) {
+    const joint = joints[name];
+    if (joint && typeof joint.setJointValue === "function") {
+      joint.setJointValue(value);
+      applied = true;
+    }
+  }
+
+  if (!applied && !robot._jointApplyWarned) {
+    console.warn("[viewer] no matching URDF joints found for", robot.name || robot.robot_type, jointNames);
+    robot._jointApplyWarned = true;
+  }
+  urdfRobot.updateMatrixWorld?.(true);
+}
+
+function uniqueRobotRoots(urdfRobot, collisionUrdfRobot) {
+  if (collisionUrdfRobot && collisionUrdfRobot !== urdfRobot) {
+    return urdfRobot ? [urdfRobot, collisionUrdfRobot] : [collisionUrdfRobot];
+  }
+  return urdfRobot ? [urdfRobot] : [];
+}
+
+/**
+ * Update robot poses for current timestep.
+ * For sphere robots (robot_type === "sphere"), config [x,y,z] is the position.
+ */
+function updateRobotsForTimestep() {
+  if (!resultData) return;
+  robotMeshes.forEach(({ mesh, robot, urdfRobot, collisionUrdfRobot }) => {
+    const cfg = configAt(robot, currentTimestep);
+    const pose = robot.base_pose || { position: [0, 0, 0], quaternion_xyzw: [0, 0, 0, 1] };
+    const pos = pose.position || [0, 0, 0];
+    const q = pose.quaternion_xyzw || [0, 0, 0, 1];
+    if (urdfRobot) {
+      for (const root of uniqueRobotRoots(urdfRobot, collisionUrdfRobot)) {
+        root.position.set(pos[0], pos[1], pos[2]);
+        root.quaternion.set(q[0], q[1], q[2], q[3]);
+        applyJointConfig(root, robot, cfg);
+      }
+    } else {
+      // Sphere robots: config [x,y,z] is the world position
+      if (robot.robot_type === "sphere" && cfg && cfg.length >= 3) {
+        mesh.position.set(cfg[0], cfg[1], cfg[2]);
+      } else {
+        mesh.position.set(pos[0], pos[1], pos[2]);
+      }
+      mesh.quaternion.set(q[0], q[1], q[2], q[3]);
+    }
+  });
+  if (showCrossSection2D) refreshCrossSection2D();
+}
+
+/**
+ * Update UI.
+ */
+function updateUI() {
+  if (!resultData) {
+    if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
+    if (playPauseBtn) {
+      playPauseBtn.textContent = "Play";
+      playPauseBtn.disabled = true;
+    }
+    if (sliderEl) sliderEl.disabled = true;
+    syncCrossSectionToggleButton();
+    return;
+  }
+  const maxT = Math.max(0, resultData.timesteps - 1);
+  if (timestepEl) timestepEl.textContent = `Timestep ${currentTimestep} / ${maxT}`;
+  if (sliderEl) {
+    sliderEl.disabled = false;
+    sliderEl.value = currentTimestep;
+    sliderEl.max = maxT;
+  }
+  if (playPauseBtn) {
+    playPauseBtn.disabled = maxT <= 0;
+    playPauseBtn.textContent = isPlaying ? "Pause" : "Play";
+  }
+  syncCrossSectionToggleButton();
+}
+
+/**
+ * Set timestep and update scene/UI.
+ */
+function setTimestep(t) {
+  if (!resultData) return;
+  const maxT = Math.max(0, resultData.timesteps - 1);
+  currentTimestep = Math.max(0, Math.min(t, maxT));
+  updateRobotsForTimestep();
+  updateUI();
+}
+
+/**
+ * Step forward/backward.
+ */
+function step(delta) {
+  setTimestep(currentTimestep + delta);
+}
+
+/**
+ * Toggle play/pause.
+ */
+function togglePlay() {
+  isPlaying = !isPlaying;
+  if (isPlaying) {
+    playIntervalId = setInterval(() => {
+      if (currentTimestep >= resultData.timesteps - 1) {
+        isPlaying = false;
+        if (playIntervalId) clearInterval(playIntervalId);
+      } else {
+        step(1);
+      }
+    }, 1000 / PLAY_FPS);
+  } else {
+    if (playIntervalId) {
+      clearInterval(playIntervalId);
+      playIntervalId = null;
+    }
+  }
+  updateUI();
+}
+
+/**
+ * Keyboard handler.
+ */
+function onKeyDown(e) {
+  if (!resultData) return;
+  switch (e.code) {
+    case "ArrowLeft":
+      step(e.shiftKey ? -10 : -1);
+      e.preventDefault();
+      break;
+    case "ArrowRight":
+      step(e.shiftKey ? 10 : 1);
+      e.preventDefault();
+      break;
+    case "Home":
+      setTimestep(0);
+      e.preventDefault();
+      break;
+    case "End":
+      setTimestep(resultData.timesteps - 1);
+      e.preventDefault();
+      break;
+    case "Space":
+      togglePlay();
+      e.preventDefault();
+      break;
+  }
+}
+
+/**
+ * Initialize Three.js scene.
+ */
+function initScene() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xffffff);
+
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 100);
+  camera.position.set(2, 2, 2);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  document.getElementById("canvas-container").appendChild(renderer.domElement);
+
+  controls = new TrackballControls(camera, renderer.domElement);
+  controls.rotateSpeed = 1.35;
+  controls.staticMoving = false;
+  controls.dynamicDampingFactor = 0.05;
+
+  ambientLight = new THREE.AmbientLight(0xffffff, 0.22);
+  scene.add(ambientLight);
+
+  sunLight = new THREE.DirectionalLight(0xffffff, 1.05);
+  sunLight.position.set(0, 0, 100);
+  sunLight.target.position.set(0, 0, 0);
+  scene.add(sunLight.target);
+  scene.add(sunLight);
+  sunLight.castShadow = true;
+  sunLight.shadow.mapSize.set(2048, 2048);
+  sunLight.shadow.bias = -0.00015;
+  const sc = sunLight.shadow.camera;
+  sc.near = 0.5;
+  sc.far = 220;
+  sc.left = -10;
+  sc.right = 10;
+  sc.top = 10;
+  sc.bottom = -10;
+  sc.updateProjectionMatrix();
+
+  window.addEventListener("resize", () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    controls.handleResize();
+  });
+
+  window.addEventListener("keydown", onKeyDown);
+}
+
+function syncLightingToggleButton() {
+  const btn = document.getElementById("lighting-toggle");
+  if (!btn) return;
+  btn.textContent = lightingKeyMode ? "Key + ambient" : "Ambient only";
+  btn.title = lightingKeyMode
+    ? "Directional sun + dim ambient (shadows on). Click for ambient-only fill."
+    : "Even ambient, directional off. Click to restore key light + shadows.";
+}
+
+function applyLightingMode() {
+  if (!ambientLight || !sunLight) return;
+  if (lightingKeyMode) {
+    ambientLight.intensity = 0.22;
+    sunLight.intensity = 1.05;
+    sunLight.visible = true;
+    sunLight.castShadow = true;
+  } else {
+    ambientLight.intensity = 0.92;
+    sunLight.intensity = 0;
+    sunLight.visible = false;
+    sunLight.castShadow = false;
+  }
+}
+
+function toggleLightingMode() {
+  lightingKeyMode = !lightingKeyMode;
+  applyLightingMode();
+  syncLightingToggleButton();
+}
+
+function withTrailingSlash(url) {
+  return url.endsWith("/") ? url : `${url}/`;
+}
+
+function robotVisualUrdfPath(robot) {
+  return robot.visual_urdf_path || robot.urdf_path || "";
+}
+
+function robotCollisionUrdfPath(robot) {
+  if (robot.collision_urdf_path) return robot.collision_urdf_path;
+  if (robot.planning_urdf_path) return robot.planning_urdf_path;
+
+  const visualPath = robotVisualUrdfPath(robot);
+  const lowerType = String(robot.robot_type || "").toLowerCase();
+  const lowerPath = String(visualPath || "").toLowerCase();
+  const isPlanar3 = lowerType === "planar3" || lowerPath.includes("planar3");
+  if (!isPlanar3) return "";
+
+  if (/planar3\.urdf$/i.test(visualPath)) {
+    return visualPath.replace(/planar3\.urdf$/i, "planar3_spherized.urdf");
+  }
+  if (!visualPath) return "resources/planar3/planar3_spherized.urdf";
+  return "";
+}
+
+function assetUrl(assetBase, path) {
+  return /^https?:\/\//i.test(path) ? path : new URL(path, assetBase).href;
+}
+
+/**
+ * Base URL for repo-root assets (URDF, meshes, result JSON from ?file=).
+ * - Optional override: ?assetBase=https://host/repo/ or ?assetBase=../ (resolved vs this page)
+ * - If this module is served as .../viewer/js/app.js, repo root is two levels up (../../).
+ * - If the page URL path contains "viewer" (e.g. /viewer/), use the parent directory.
+ * - Otherwise use the site origin. For python -m http.server --directory viewer, add a
+ *   symlink viewer/resources -> ../resources so /resources/... exists on that server.
+ */
+function getAssetBaseUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const override = params.get("assetBase");
+  if (override) {
+    const resolved = new URL(override, window.location.href).href;
+    return withTrailingSlash(resolved);
+  }
+  try {
+    const moduleUrl = new URL(import.meta.url);
+    if (moduleUrl.pathname.includes("/viewer/js/")) {
+      return withTrailingSlash(new URL("../../", moduleUrl).href);
+    }
+  } catch (_) {
+    /* import.meta.url unavailable */
+  }
+  if (window.location.pathname.includes("/viewer")) {
+    return withTrailingSlash(new URL("../", window.location.href).href);
+  }
+  return withTrailingSlash(`${window.location.origin}/`);
+}
+
+/**
+ * Wait until every loadMeshCb (OBJ/STL) has invoked the URDF completion callback.
+ * LoadingManager.onLoad is unreliable here (ordering with fetch, duplicates, etc.).
+ */
+async function waitForUrdfMeshCallbacks(getPending, timeoutMs = 120000) {
+  const t0 = performance.now();
+  while (getPending() > 0) {
+    if (performance.now() - t0 > timeoutMs) {
+      console.warn("[viewer] timed out waiting for URDF mesh files; coloring whatever loaded");
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 16));
+  }
+}
+
+/**
+ * Load URDF, wait until async mesh files finish populating the tree, then apply solid color.
+ * URDFLoader's load() resolves after parse; geometry is added in mesh load callbacks later.
+ */
+async function loadUrdfRobotWithSolidColor(assetBase, urdfUrl, colorHex) {
+  const loader = createURDFLoader(assetBase);
+  const getPending =
+    typeof loader.getPendingMeshLoads === "function"
+      ? () => loader.getPendingMeshLoads()
+      : () => 0;
+  const urdfRobot = await loadURDFAsync(loader, urdfUrl);
+  await waitForUrdfMeshCallbacks(getPending);
+  applyRobotSolidColor(urdfRobot, colorHex);
+  setUrdfRobotGeometryVisibility(urdfRobot, showRobotCollisionGeometry);
+  return urdfRobot;
+}
+
+/**
+ * Load result and build scene. Loads URDFs when urdf_path is present.
+ */
+async function loadResult(data) {
+  resultData = data;
+  currentTimestep = 0;
+
+  clearCrossSection2DGroup();
+  obstacleMeshes.forEach((m) => scene.remove(m));
+  robotMeshes.forEach((r) => {
+    if (r.urdfRobot) scene.remove(r.urdfRobot);
+    if (r.collisionUrdfRobot && r.collisionUrdfRobot !== r.urdfRobot) {
+      scene.remove(r.collisionUrdfRobot);
+    }
+    if (r.mesh) scene.remove(r.mesh);
+  });
+  obstacleMeshes = [];
+  robotMeshes = [];
+
+  const obsGroup = buildObstacles(data);
+  scene.add(obsGroup);
+  obstacleMeshes.push(obsGroup);
+
+  const assetBase = getAssetBaseUrl();
+
+  for (const robot of data.robots) {
+    const robotColor = randomRobotColorHex();
+    const urdfPath = robotVisualUrdfPath(robot);
+    const collisionUrdfPath = robotCollisionUrdfPath(robot);
+    if (urdfPath) {
+      try {
+        const urdfUrl = assetUrl(assetBase, urdfPath);
+        const urdfRobot = await loadUrdfRobotWithSolidColor(assetBase, urdfUrl, robotColor);
+        let collisionUrdfRobot = null;
+        if (collisionUrdfPath && collisionUrdfPath !== urdfPath) {
+          try {
+            const collisionUrl = assetUrl(assetBase, collisionUrdfPath);
+            collisionUrdfRobot = await loadUrdfRobotWithSolidColor(
+              assetBase,
+              collisionUrl,
+              robotColor
+            );
+            console.info(
+              "[viewer] Loaded separate collision URDF for",
+              robot.name || robot.robot_type,
+              collisionUrdfPath
+            );
+          } catch (err) {
+            console.warn(
+              "[viewer] Collision URDF load failed for",
+              collisionUrdfPath,
+              err
+            );
+          }
+        }
+
+        robotMeshes.push({
+          mesh: null,
+          robot,
+          urdfRobot,
+          collisionUrdfRobot,
+          colorHex: robotColor,
+        });
+        scene.add(urdfRobot);
+        if (collisionUrdfRobot) scene.add(collisionUrdfRobot);
+        applyRobotGeometryModeToScene();
+      } catch (err) {
+        console.warn("URDF load failed for", urdfPath, err);
+        const ph = buildPlaceholderRobot(robot, robotColor);
+        robotMeshes.push(ph);
+        scene.add(ph.mesh);
+      }
+    } else {
+      const ph = buildPlaceholderRobot(robot, robotColor);
+      robotMeshes.push(ph);
+      scene.add(ph.mesh);
+    }
+  }
+
+  setTimestep(0);
+  updateUI();
+  applySceneDisplayMode();
+  if (showCrossSection2D) applyCrossSectionCamera();
+  else applyResultCamera(data);
+}
+
+/**
+ * Load JSON from file input.
+ */
+function loadFromFile(file) {
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const data = parseResult(e.target.result);
+    if (data) {
+      await loadResult(data);
+    } else {
+      if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
+      alert("Invalid or unsupported JSON format.");
+    }
+  };
+  reader.readAsText(file);
+}
+
+/**
+ * Load JSON from URL. Path is relative to server root.
+ */
+async function loadFromUrl(path) {
+  try {
+    if (timestepEl) timestepEl.textContent = "Loading...";
+    const url = path.startsWith("http")
+      ? path
+      : new URL(path.replace(/^\//, ""), getAssetBaseUrl()).href;
+    const res = await fetch(url);
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${path}`);
+    }
+    const data = parseResult(text);
+    if (data) await loadResult(data);
+    else {
+      if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
+      alert("Invalid or unsupported JSON format.");
+    }
+  } catch (err) {
+    if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
+    alert("Failed to load: " + err.message);
+  }
+}
+
+/**
+ * Animation loop.
+ */
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  syncCameraInputsFromOrbit();
+  renderer.render(scene, camera);
+}
+
+/**
+ * Main init.
+ */
+function init() {
+  initScene();
+  initCameraPanel();
+  syncCameraInputsFromOrbit();
+
+  timestepEl = document.getElementById("timestep");
+  playPauseBtn = document.getElementById("play-pause");
+  sliderEl = document.getElementById("timestep-slider");
+
+  document.getElementById("file-input").addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    if (f) {
+      if (timestepEl) timestepEl.textContent = "Loading...";
+      loadFromFile(f);
+    }
+  });
+
+  if (playPauseBtn) playPauseBtn.addEventListener("click", togglePlay);
+
+  if (sliderEl) {
+    sliderEl.addEventListener("input", (e) => setTimestep(parseInt(e.target.value, 10)));
+  }
+
+  const lightingBtn = document.getElementById("lighting-toggle");
+  if (lightingBtn) {
+    applyLightingMode();
+    syncLightingToggleButton();
+    lightingBtn.addEventListener("click", toggleLightingMode);
+  }
+
+  const geometryBtn = document.getElementById("geometry-toggle");
+  if (geometryBtn) {
+    syncGeometryToggleButton();
+    geometryBtn.addEventListener("click", toggleRobotGeometryMode);
+  }
+
+  const crossSectionBtn = document.getElementById("cross-section-toggle");
+  if (crossSectionBtn) {
+    syncCrossSectionToggleButton();
+    crossSectionBtn.addEventListener("click", toggleCrossSection2DMode);
+  }
+
+  // URL param ?file=<path-to-result-json>
+  const params = new URLSearchParams(window.location.search);
+  const fileParam = params.get("file");
+  if (fileParam) {
+    loadFromUrl(fileParam);
+  }
+
+  updateUI();
+  animate();
+}
+
+init();

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<robot name="planar3">
+  <group name="manipulator">
+    <chain base_link="base_sphere" tip_link="ee_sphere"/>
+  </group>
+
+  <group_state name="straight" group="manipulator">
+    <joint name="planar3_joint1" value="0"/>
+    <joint name="planar3_joint2" value="0"/>
+    <joint name="planar3_joint3" value="0"/>
+  </group_state>
+
+  <disable_collisions link1="base_sphere" link2="link1_cylinder" reason="Adjacent"/>
+  <disable_collisions link1="link1_cylinder" link2="joint1_sphere" reason="Adjacent"/>
+  <disable_collisions link1="joint1_sphere" link2="link2_cylinder" reason="Adjacent"/>
+  <disable_collisions link1="link2_cylinder" link2="joint2_sphere" reason="Adjacent"/>
+  <disable_collisions link1="joint2_sphere" link2="link3_cylinder" reason="Adjacent"/>
+  <disable_collisions link1="link3_cylinder" link2="ee_sphere" reason="Adjacent"/>
+</robot>

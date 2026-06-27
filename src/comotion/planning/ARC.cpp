@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -121,6 +122,7 @@ void ARC::resetArcSolveState() {
     pair_conflict_scan_start_t_.clear();
     true_arrival_timesteps_.clear();
     last_subproblem_window_start_ = -1;
+    warned_bounded_prioritized_disabled_ = false;
     num_conflicts_ = 0;
     num_subproblem_attempts_ = 0;
     num_temporal_expansions_ = 0;
@@ -628,6 +630,7 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
             }
         }
         std::optional<std::uint64_t> local_makespan_bound_timesteps;
+        bool skip_bounded_local_attempt_for_epsilon = false;
         if (global_makespan_bound_timesteps_) {
             std::uint64_t min_slack =
                 std::numeric_limits<std::uint64_t>::max();
@@ -646,9 +649,20 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
             }
             if (min_slack == std::numeric_limits<std::uint64_t>::max())
                 min_slack = 0;
-            local_makespan_bound_timesteps =
+            std::uint64_t raw_local_bound =
                 static_cast<std::uint64_t>(std::max(0, end_t - start_t)) +
                 min_slack;
+            if (!temporal_full_window &&
+                bounded_local_repair_epsilon_timesteps_ > 0) {
+                if (raw_local_bound <=
+                    bounded_local_repair_epsilon_timesteps_) {
+                    skip_bounded_local_attempt_for_epsilon = true;
+                } else {
+                    raw_local_bound -=
+                        bounded_local_repair_epsilon_timesteps_;
+                }
+            }
+            local_makespan_bound_timesteps = raw_local_bound;
         }
 
         const auto remainingWall = [&]() {
@@ -659,10 +673,24 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
             return rem > 0.0 ? rem : 0.0;
         };
 
-        if (local_endpoints_valid) {
-            const bool use_prioritized =
+        if (local_endpoints_valid &&
+            !skip_bounded_local_attempt_for_epsilon) {
+            const bool bounded_arc_subproblem =
+                global_makespan_bound_timesteps_.has_value();
+            const bool prioritized_requested =
                 local_solver_mode_ != LocalSolverMode::CompositeRrtOnly;
+            if (bounded_arc_subproblem && prioritized_requested &&
+                !warned_bounded_prioritized_disabled_) {
+                std::cerr
+                    << "Warning: bounded ARC ignores PrioritizedSTRRT local "
+                       "repair requests and uses only the composite bounded "
+                       "subproblem solver.\n";
+                warned_bounded_prioritized_disabled_ = true;
+            }
+            const bool use_prioritized =
+                prioritized_requested && !bounded_arc_subproblem;
             const bool use_composite =
+                bounded_arc_subproblem ||
                 local_solver_mode_ != LocalSolverMode::PrioritizedStrrtOnly;
             // Layer 1: Prioritized ST-RRT*
             if (use_prioritized) {
@@ -1033,6 +1061,8 @@ ARC::ArcPlannerStatsSummary ARC::currentArcPlannerStatsSummary() const {
         local_prioritized_strrt_max_iterations_;
     summary.local_composite_rrt_use_makespan_metric =
         local_composite_rrt_use_makespan_metric_;
+    summary.bounded_local_repair_epsilon_timesteps =
+        bounded_local_repair_epsilon_timesteps_;
     summary.num_conflicts = num_conflicts_;
     summary.subproblem_attempts = num_subproblem_attempts_;
     summary.temporal_expansions = num_temporal_expansions_;
@@ -1063,6 +1093,8 @@ nlohmann::json ARC::plannerStatsJsonFromSummary(
         summary.local_prioritized_strrt_max_iterations;
     stats["local_composite_rrt_use_makespan_metric"] =
         summary.local_composite_rrt_use_makespan_metric;
+    stats["bounded_local_repair_epsilon_timesteps"] =
+        summary.bounded_local_repair_epsilon_timesteps;
     stats["num_conflicts"] = summary.num_conflicts;
     stats["subproblem_attempts"] = summary.subproblem_attempts;
     stats["temporal_expansions"] = summary.temporal_expansions;
@@ -1179,6 +1211,14 @@ SubproblemConflict ARC::expandConflictForSubproblem(
 
 ompl::base::PlannerStatus ARC::solve(double timeLimit) {
     resetArcSolveState();
+    if (global_makespan_bound_timesteps_ &&
+        local_solver_mode_ != LocalSolverMode::CompositeRrtOnly) {
+        std::cerr
+            << "Warning: bounded ARC ignores PrioritizedSTRRT local "
+               "repair requests and uses only the composite bounded "
+               "subproblem solver.\n";
+        warned_bounded_prioritized_disabled_ = true;
+    }
     auto start_time = Clock::now();
     const auto finalizePlannerStats = [&](bool exact_solution = false) {
         auto stats = plannerStatsJsonFromSummary(

@@ -448,6 +448,8 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
                 parseArcLocalSolverMode(options.arc_local_solvers));
             planner->setLocalPrioritizedStrrtMaxIterations(
                 options.arc_local_prioritized_max_iterations);
+            planner->setBoundedLocalRepairEpsilonTimesteps(
+                options.ao_arc_local_bound_epsilon_timesteps);
             planner->setSimplifyInitialSolutions(
                 options.arc_simplify_initial_solutions);
             planner->setSimplifyConflictSolutions(

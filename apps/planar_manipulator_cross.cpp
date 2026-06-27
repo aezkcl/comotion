@@ -84,6 +84,7 @@ struct AppOptions {
     bool arc_simplify_conflict_solutions = false;
     std::string arc_local_solvers = "both";
     unsigned int arc_local_prioritized_max_iterations = 5;
+    std::uint64_t ao_arc_local_bound_epsilon_timesteps = 1;
     unsigned int or_parallel_worker_processes = 1;
     unsigned int parallel_arc_worker_processes = 2;
     bool parallel_arc_parallel_initial_plans = true;
@@ -525,6 +526,7 @@ void printUsage(const char *prog) {
         << "  --aorrtc-max-internal-vertices <n>\n"
         << "  --arc-local-solvers <both|prioritized|composite> (default: both)\n"
         << "  --arc-local-prioritized-max-iterations <n> (default: 5; 0 disables cap)\n"
+        << "  --ao-arc-local-bound-epsilon-timesteps <n> (default: 1; 0 disables)\n"
         << "  --cooperative-rrt-worker-threads <n>\n"
         << "  --or-parallel-worker-processes <n>\n"
         << "  --parallel-arc-worker-processes <n>\n"
@@ -656,6 +658,10 @@ AppOptions parseArgs(int argc, char **argv) {
             options.arc_local_prioritized_max_iterations =
                 static_cast<unsigned int>(
                     std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--ao-arc-local-bound-epsilon-timesteps") {
+            options.ao_arc_local_bound_epsilon_timesteps =
+                static_cast<std::uint64_t>(
+                    std::stoull(requireValue(i, argc, argv, arg)));
         } else if (arg == "--or-parallel-worker-processes") {
             options.or_parallel_worker_processes = static_cast<unsigned int>(
                 std::stoul(requireValue(i, argc, argv, arg)));

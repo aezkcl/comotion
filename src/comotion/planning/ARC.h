@@ -95,6 +95,12 @@ public:
     void clearGlobalMakespanBoundTimesteps() {
         global_makespan_bound_timesteps_.reset();
     }
+    void setBoundedLocalRepairEpsilonTimesteps(std::uint64_t epsilon) {
+        bounded_local_repair_epsilon_timesteps_ = epsilon;
+    }
+    std::uint64_t boundedLocalRepairEpsilonTimesteps() const {
+        return bounded_local_repair_epsilon_timesteps_;
+    }
 
     /// Multiplier for local STRRT* OMPL time upper bound: (end_t - start_t) timesteps /
     /// resolution (seconds) times this factor. Must be positive (default 4).
@@ -117,6 +123,7 @@ protected:
         LocalSolverMode local_solver_mode = LocalSolverMode::Both;
         unsigned int local_prioritized_strrt_max_iterations = 0;
         bool local_composite_rrt_use_makespan_metric = false;
+        std::uint64_t bounded_local_repair_epsilon_timesteps = 1;
         std::uint64_t num_conflicts = 0;
         std::uint64_t subproblem_attempts = 0;
         std::uint64_t temporal_expansions = 0;
@@ -257,6 +264,8 @@ protected:
     bool simplify_conflict_solutions_ = false;
     PathSimplificationOptions simplification_options_{};
     std::optional<std::uint64_t> global_makespan_bound_timesteps_;
+    std::uint64_t bounded_local_repair_epsilon_timesteps_ = 1;
+    bool warned_bounded_prioritized_disabled_ = false;
     /// Scales local window duration (seconds) -> SpaceTimeStateSpace upper bound.
     double strrt_space_time_span_factor_ = 4.0;
     std::uint64_t num_conflicts_ = 0;

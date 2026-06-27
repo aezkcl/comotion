@@ -20,6 +20,8 @@ void AOARC::configureArcAttempt(ARC &planner) const {
     planner.setLocalSolverMode(local_solver_mode_);
     planner.setLocalPrioritizedStrrtMaxIterations(
         local_prioritized_strrt_max_iterations_);
+    planner.setBoundedLocalRepairEpsilonTimesteps(
+        bounded_local_repair_epsilon_timesteps_);
     planner.setUseCspaceBounds(use_cspace_bounds_);
     planner.setCspaceBoundMargin(cspace_bound_margin_);
     planner.setMinCspaceBoundRange(min_cspace_bound_range_);

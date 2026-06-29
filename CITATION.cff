@@ -23,6 +23,7 @@ preferred-citation:
       given-names: Nancy M.
   journal: "arXiv preprint arXiv:2604.23960"
   year: 2026
+  url: "https://doi.org/10.48550/arXiv.2604.23960"
 references:
   - type: article
     title: "P-ARC: Exploiting Subproblem Independence for Parallel Multi-Robot Motion Planning"
@@ -33,7 +34,9 @@ references:
         given-names: Marco
       - family-names: Amato
         given-names: Nancy M.
+    journal: "arXiv preprint arXiv:2606.27625"
     year: 2026
+    url: "https://doi.org/10.48550/arXiv.2606.27625"
   - type: article
     title: "AO-ARC: Almost-Surely Asymptotically Optimal Multi-Robot Motion Planning with ARC"
     authors:
@@ -43,4 +46,7 @@ references:
         given-names: Marco
       - family-names: Amato
         given-names: Nancy M.
+    journal: "arXiv preprint arXiv:2606.27495"
     year: 2026
+    url: "https://doi.org/10.48550/arXiv.2606.27495"
+

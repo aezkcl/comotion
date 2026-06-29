@@ -1,7 +1,7 @@
 # CoMotion
 
 CoMotion, short for Coordinated Motion Planning for Multi-Robot Systems, is a
-C++ multi-robot motion-planning library and benchmark suite built on the
+C++ multi-robot motion planning library and benchmark suite built on the
 CoMotion forks of OMPL and VAMP.
 
 The repository has two public entry points:
@@ -168,7 +168,8 @@ If you use CoMotion, please cite:
   title={Multi-Robot Motions in Milliseconds: Vector-Accelerated Primitives for Sampling-Based Planning},
   author={Motes, James D and Morales, Marco and Amato, Nancy M},
   journal={arXiv preprint arXiv:2604.23960},
-  year={2026}
+  year={2026},
+  url={https://doi.org/10.48550/arXiv.2604.23960}
 }
 ```
 
@@ -178,7 +179,9 @@ For work using P-ARC, OR-ARC, or OR-P-ARC, also cite:
 @article{motes2026parc,
   title={P-ARC: Exploiting Subproblem Independence for Parallel Multi-Robot Motion Planning},
   author={Motes, James D and Morales, Marco and Amato, Nancy M},
-  year={2026}
+  journal={arXiv preprint arXiv:2606.27625},
+  year={2026},
+  url={https://doi.org/10.48550/arXiv.2606.27625}
 }
 ```
 
@@ -188,7 +191,9 @@ For work using AO-ARC or Composite AORRTC, also cite:
 @article{motes2026aoarc,
   title={AO-ARC: Almost-Surely Asymptotically Optimal Multi-Robot Motion Planning with ARC},
   author={Motes, James D and Morales, Marco and Amato, Nancy M},
-  year={2026}
+  journal={arXiv preprint arXiv:2606.27495},
+  year={2026},
+  url={https://doi.org/10.48550/arXiv.2606.27495}
 }
 ```
 

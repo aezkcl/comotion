@@ -60,12 +60,51 @@ int main() {
     path.push_back({0.5, 0.0, 0.0});
     path.computeTimestepsFromDistance(problem.resolution(), problem.vmax());
 
+    auto robot_b = std::make_shared<comotion::FlyingSphere>(
+        0.25, std::vector<double>{-1.0, -1.0, 0.0},
+        std::vector<double>{1.0, 1.0, 0.0});
+    comotion::Path path_b;
+    path_b.push_back({-0.5, 1.0, 0.0});
+    path_b.push_back({0.5, 1.0, 0.0});
+    path_b.computeTimestepsFromDistance(problem.resolution(), problem.vmax());
+
+    comotion::CollisionChecker::resetValidationTimingStats();
+    const std::vector<comotion::Path> validation_paths{path, path_b};
+    const std::vector<const comotion::RobotModel *> validation_robots{
+        robot.get(), robot_b.get()};
+    checker.validateCompositePaths(validation_paths, validation_robots,
+                                   validation_options);
+    const auto timed_validation =
+        comotion::CollisionChecker::validationTimingStats();
+    if (timed_validation.total_validation_calls == 0 ||
+        timed_validation.composite_paths_calls == 0)
+        return 2;
+
+    comotion::CollisionChecker::resetValidationTimingStats();
+    checker.isValidSingleFull(*robot, {-0.5, 0.0, 0.0});
+    const auto single_robot_validation =
+        comotion::CollisionChecker::validationTimingStats();
+    if (single_robot_validation.total_validation_calls != 0)
+        return 3;
+
     comotion::PathSimplificationOptions simplification_options;
     simplification_options.max_shortcut_steps = 1;
 
     comotion::ARC arc;
     arc.setProblem(std::make_shared<comotion::MultiRobotProblem>(problem));
     arc.setPathSimplificationOptions(simplification_options);
+    arc.setConflictPathSimplificationOptions(simplification_options);
+    arc.setLocalCompositeRrtRange(0.5);
+    arc.setExpansionPolicy(
+        comotion::ARC::ExpansionPolicy::CustomMultiplied);
+    arc.setCustomExpansionMultipliers({1.0, 2.0, 4.0});
+    arc.setInitialValidWindowExpansionPolicy(
+        comotion::ARC::ExpansionPolicy::Logarithmic);
+    arc.setInitialValidWindowExpansionStep(2);
+    arc.setInitialValidWindowExpansionMultipliers({1.0, 2.0});
+    arc.clearInitialValidWindowExpansionPolicy();
+    arc.clearInitialValidWindowExpansionStep();
+    arc.clearInitialValidWindowExpansionMultipliers();
 
     comotion::AOARC ao_arc;
     ao_arc.setProblem(std::make_shared<comotion::MultiRobotProblem>(problem));
@@ -73,6 +112,7 @@ int main() {
     comotion::CompositeRRT composite_rrt;
     composite_rrt.setProblem(std::make_shared<comotion::MultiRobotProblem>(problem));
     composite_rrt.setRobotIndices({0});
+    composite_rrt.setPathSimplificationOptions(simplification_options);
 
     comotion::CompositeRRTStar composite_rrt_star;
     composite_rrt_star.setMetricMode(
@@ -126,6 +166,7 @@ int main() {
     (void)conflict_checker;
     (void)validation_options;
     (void)path;
+    (void)path_b;
     (void)ao_arc;
     (void)composite_rrt;
     (void)composite_rrt_star;

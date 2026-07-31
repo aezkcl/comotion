@@ -1,0 +1,75 @@
+{
+  "apps": {
+    "panda_cage_n4_arc_cross_100s": {
+      "methods": {
+        "arc": {
+          "extra_args": [],
+          "mean_effective_planning_time_seconds": 0.048372761625,
+          "mean_successful_planning_time_seconds": 0.048372761625,
+          "param_set": "tiny_250k_makespan_metric",
+          "params": {
+            "arc_expansion_step": 50,
+            "arc_initial_window": 50,
+            "arc_local_composite_max_samples": 250000,
+            "arc_local_composite_use_makespan_metric": true,
+            "arc_local_prioritized_max_iterations": 10,
+            "arc_local_solvers": "composite",
+            "arc_simplify_conflict_solutions": false,
+            "arc_simplify_initial_solutions": true,
+            "drrt_cost_metric": "makespan",
+            "drrt_iterations_per_batch": 32,
+            "drrt_roadmap_size": 300,
+            "drrt_tensor_search": "drrt",
+            "parallel_arc_conflict_find_horizon": 200,
+            "stcbs_max_samples": 75000,
+            "strrt_initial_batch_size": 4096,
+            "strrt_initial_time_factor": 4.0,
+            "strrt_return_first_solution": true,
+            "strrt_rewiring": "off",
+            "strrt_time_bound_factor_increase": 2.0
+          },
+          "success_count": 8,
+          "trial_count": 8
+        }
+      }
+    },
+    "panda_cage_n8_arc_cross_100s": {
+      "methods": {
+        "arc": {
+          "extra_args": [],
+          "mean_effective_planning_time_seconds": 1.348255046875,
+          "mean_successful_planning_time_seconds": 1.348255046875,
+          "param_set": "tiny_250k_makespan_metric",
+          "params": {
+            "arc_expansion_step": 50,
+            "arc_initial_window": 50,
+            "arc_local_composite_max_samples": 250000,
+            "arc_local_composite_use_makespan_metric": true,
+            "arc_local_prioritized_max_iterations": 10,
+            "arc_local_solvers": "composite",
+            "arc_simplify_conflict_solutions": false,
+            "arc_simplify_initial_solutions": true,
+            "drrt_cost_metric": "makespan",
+            "drrt_iterations_per_batch": 32,
+            "drrt_roadmap_size": 300,
+            "drrt_tensor_search": "drrt",
+            "parallel_arc_conflict_find_horizon": 200,
+            "stcbs_max_samples": 75000,
+            "strrt_initial_batch_size": 4096,
+            "strrt_initial_time_factor": 4.0,
+            "strrt_return_first_solution": true,
+            "strrt_rewiring": "off",
+            "strrt_time_bound_factor_increase": 2.0
+          },
+          "success_count": 8,
+          "trial_count": 8
+        }
+      }
+    }
+  },
+  "created_utc": "2026-07-09T21:37:56.478692+00:00",
+  "schema": "comotion.best_planner_parameters.v1",
+  "selection_rule": "Select the lowest mean successful planning_time_seconds; param sets with no successful trials rank after successful sets.",
+  "source_config": "benchmarks/configs/panda_cage_arc_windows_metric_effort_100s_8seed_sweep.json",
+  "source_output_root": "benchmarks/results/panda_cage_arc_windows_metric_effort_100s_8seed_sweep"
+}

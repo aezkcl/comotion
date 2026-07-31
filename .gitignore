@@ -1,4 +1,6 @@
 build*/
+/_CPack_Packages/
+/*-Source.tar.gz
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -10,3 +12,16 @@ __pycache__/
 results/
 benchmarks/results/
 comotion-results/
+
+# Local research artifacts. Published benchmark inputs belong under resources/;
+# generated results and working-paper media stay outside the source release.
+/*.csv
+/papers/
+/video/
+/viewer/data/
+/benchmarks/configs/panda_cage_n8_arc_*.json
+/benchmarks/scripts/*_07_*.py
+/benchmarks/scripts/run_*_campaign_*.py
+/benchmarks/scripts/analyze_arc_conflict_timings.py
+/benchmarks/scripts/export_validation_chunk_csv.py
+/benchmarks/scripts/plot_arc_runtime_*.py

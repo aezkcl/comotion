@@ -22,6 +22,13 @@ public:
         priority_order_ = order;
     }
 
+    // Concatenate groups in the supplied order while optionally shuffling
+    // within each group. This supports heterogeneous teams whose robot-class
+    // precedence must remain fixed while priorities vary by seed.
+    void setPriorityGroups(const std::vector<std::vector<int>> &groups) {
+        priority_groups_ = groups;
+    }
+
     void setShufflePriorityOrder(bool v) { shuffle_priority_order_ = v; }
 
     // Per-robot time limit fraction (of total). Defaults to a dynamic split of
@@ -86,6 +93,7 @@ public:
 
 private:
     std::vector<int> priority_order_;
+    std::vector<std::vector<int>> priority_groups_;
     std::vector<Path> solution_paths_;
     std::vector<double> last_robot_solve_times_seconds_;
     bool shuffle_priority_order_ = false;

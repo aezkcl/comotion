@@ -801,6 +801,10 @@ public:
         rebuildEnvironmentObjects();
     }
 
+    ValidationWorkStats lastValidationWorkStats() const override {
+        return last_work_stats_;
+    }
+
     void rebuildEnvironmentObjects() {
         env_geoms_.clear();
         env_transforms_.clear();
@@ -911,6 +915,95 @@ public:
         return true;
     }
 
+    bool isValidSingleExhaustive(
+        const RobotModel &robot, const std::vector<double> &config) const {
+        const auto &cache = robotCache(robot);
+        if (cache.prims.empty())
+            return true;
+
+        bool valid = true;
+        const auto link_tf = robot.getLinkTransforms(config);
+        for (const auto &prim : cache.prims) {
+            const Transform3 world =
+                eigenAffineToFcl(
+                    link_tf[static_cast<std::size_t>(prim.link_index)]) *
+                prim.tf_link;
+            for (std::size_t e = 0; e < env_geoms_.size(); ++e) {
+                if (fclPairCollide(prim.geom, world, env_geoms_[e],
+                                   env_transforms_[e])) {
+                    valid = false;
+                }
+            }
+        }
+        return valid;
+    }
+
+    bool isSelfCollisionFreeExhaustive(
+        const RobotModel &robot, const std::vector<double> &config) const {
+        const auto &prims = robotCache(robot).prims;
+        if (prims.size() < 2)
+            return true;
+
+        bool valid = true;
+        const auto link_tf = robot.getLinkTransforms(config);
+        for (std::size_t i = 0; i < prims.size(); ++i) {
+            const Transform3 world_i =
+                eigenAffineToFcl(
+                    link_tf[static_cast<std::size_t>(prims[i].link_index)]) *
+                prims[i].tf_link;
+            for (std::size_t j = i + 1; j < prims.size(); ++j) {
+                if (prims[i].link_index == prims[j].link_index)
+                    continue;
+                const auto &link_i =
+                    robot.links()[static_cast<std::size_t>(prims[i].link_index)];
+                const auto &link_j =
+                    robot.links()[static_cast<std::size_t>(prims[j].link_index)];
+                if (robot.isSelfCollisionDisabled(link_i.name, link_j.name))
+                    continue;
+                const Transform3 world_j =
+                    eigenAffineToFcl(
+                        link_tf[static_cast<std::size_t>(prims[j].link_index)]) *
+                    prims[j].tf_link;
+                if (fclPairCollide(prims[i].geom, world_i, prims[j].geom,
+                                   world_j)) {
+                    valid = false;
+                }
+            }
+        }
+        return valid;
+    }
+
+    bool isValidPairExhaustive(
+        const RobotModel &robot_a, const std::vector<double> &config_a,
+        const RobotModel &robot_b,
+        const std::vector<double> &config_b) const {
+        const auto &prims_a = robotCache(robot_a).prims;
+        const auto &prims_b = robotCache(robot_b).prims;
+        if (prims_a.empty() || prims_b.empty())
+            return true;
+
+        bool valid = true;
+        const auto transforms_a = robot_a.getLinkTransforms(config_a);
+        const auto transforms_b = robot_b.getLinkTransforms(config_b);
+        for (const auto &prim_a : prims_a) {
+            const Transform3 world_a =
+                eigenAffineToFcl(
+                    transforms_a[static_cast<std::size_t>(prim_a.link_index)]) *
+                prim_a.tf_link;
+            for (const auto &prim_b : prims_b) {
+                const Transform3 world_b =
+                    eigenAffineToFcl(transforms_b[static_cast<std::size_t>(
+                                         prim_b.link_index)]) *
+                    prim_b.tf_link;
+                if (fclPairCollide(prim_a.geom, world_a, prim_b.geom,
+                                   world_b)) {
+                    valid = false;
+                }
+            }
+        }
+        return valid;
+    }
+
     bool isMotionValid(const RobotModel &robot,
                        const std::vector<double> &from,
                        const std::vector<double> &to, int num_checks,
@@ -996,16 +1089,89 @@ public:
         const CompositePathValidationOptions &options,
         const std::vector<ObstacleSphere> &obstacles,
         const std::vector<ObstacleCylinder> &cylinders) const override {
+        last_work_stats_ = {};
         if (robots.size() != from.size() || robots.size() != to.size())
             return false;
 
         const int num_checks =
             options.discrete_num_checks_hint > 0 ? options.discrete_num_checks_hint : 10;
+        const std::size_t timestep_count =
+            static_cast<std::size_t>(num_checks) + 1;
+        const std::size_t pair_count =
+            robots.size() * (robots.size() - 1) / 2;
+        last_work_stats_.motion_timesteps_possible = timestep_count;
+        if (options.check_environment) {
+            last_work_stats_.robot_state_checks_possible =
+                timestep_count * robots.size();
+        }
+        last_work_stats_.robot_pair_checks_possible =
+            timestep_count * pair_count;
+        std::vector<bool> timestep_checked(timestep_count, false);
+        const auto mark_timestep = [&](std::size_t step) {
+            if (!timestep_checked[step]) {
+                timestep_checked[step] = true;
+                ++last_work_stats_.motion_timesteps_checked;
+            }
+        };
+        if (options.exhaustive) {
+            bool valid = true;
+            std::vector<std::vector<double>> interp(from.size());
+            if (options.check_environment) {
+                for (std::size_t i = 0; i < robots.size(); ++i) {
+                    for (int step = 0; step <= num_checks; ++step) {
+                        const double alpha =
+                            static_cast<double>(step) / static_cast<double>(num_checks);
+                        interpolateConfigInto(from[i], to[i], alpha, interp[i]);
+                        mark_timestep(static_cast<std::size_t>(step));
+                        ++last_work_stats_.robot_state_checks_completed;
+                        const bool environment_valid =
+                            isValidSingleExhaustive(*robots[i], interp[i]);
+                        const bool self_valid =
+                            isSelfCollisionFreeExhaustive(*robots[i],
+                                                          interp[i]);
+                        if (!environment_valid || !self_valid) {
+                            valid = false;
+                        }
+                    }
+                }
+            }
+
+            for (int step = 0; step <= num_checks; ++step) {
+                const double alpha =
+                    static_cast<double>(step) / static_cast<double>(num_checks);
+                for (std::size_t i = 0; i < from.size(); ++i)
+                    interpolateConfigInto(from[i], to[i], alpha, interp[i]);
+
+                for (std::size_t i = 0; i < robots.size(); ++i) {
+                    for (std::size_t j = i + 1; j < robots.size(); ++j) {
+                        mark_timestep(static_cast<std::size_t>(step));
+                        ++last_work_stats_.robot_pair_checks_completed;
+                        if (!isValidPairExhaustive(
+                                *robots[i], interp[i], *robots[j],
+                                interp[j])) {
+                            valid = false;
+                        }
+                    }
+                }
+            }
+            return valid;
+        }
+
         if (options.check_environment) {
             for (std::size_t i = 0; i < robots.size(); ++i) {
-                if (!isMotionValid(*robots[i], from[i], to[i], num_checks, obstacles,
-                                   cylinders)) {
-                    return false;
+                std::vector<double> config;
+                for (int step = 0; step <= num_checks; ++step) {
+                    const double alpha = static_cast<double>(step) /
+                                         static_cast<double>(num_checks);
+                    interpolateConfigInto(from[i], to[i], alpha, config);
+                    mark_timestep(static_cast<std::size_t>(step));
+                    ++last_work_stats_.robot_state_checks_completed;
+                    if (!isValidSingle(*robots[i], config, obstacles,
+                                       cylinders)) {
+                        return false;
+                    }
+                    if (!isSelfCollisionFree(*robots[i], config))
+                        return false;
                 }
             }
         }
@@ -1019,6 +1185,8 @@ public:
 
             for (std::size_t i = 0; i < robots.size(); ++i) {
                 for (std::size_t j = i + 1; j < robots.size(); ++j) {
+                    mark_timestep(static_cast<std::size_t>(step));
+                    ++last_work_stats_.robot_pair_checks_completed;
                     if (!isValidPair(*robots[i], interp[i], *robots[j], interp[j])) {
                         return false;
                     }
@@ -1096,6 +1264,42 @@ public:
             effectivePairStarts(paths.size(), options, effective_starts);
         const std::size_t max_t = maxPathLength(paths);
         const std::size_t end = std::min(max_t, options.t_end);
+        if (options.exhaustive) {
+            bool valid = true;
+            if (options.check_environment) {
+                for (std::size_t i = 0; i < paths.size(); ++i) {
+                    if (effective_starts[i] >= end)
+                        continue;
+                    for (std::size_t t = effective_starts[i]; t < end; ++t) {
+                        const auto &config = configAt(paths[i], t);
+                        if (!isValidSingle(*robots[i], config, obstacles,
+                                           cylinders) ||
+                            !isSelfCollisionFree(*robots[i], config)) {
+                            valid = false;
+                        }
+                    }
+                }
+            }
+
+            for (std::size_t i = 0; i < paths.size(); ++i) {
+                for (std::size_t j = i + 1; j < paths.size(); ++j) {
+                    const std::size_t pair_begin = effective_pair_starts[
+                        pairFrontierIndex(i, j, paths.size())];
+                    if (pair_begin >= end)
+                        continue;
+                    for (std::size_t t = pair_begin; t < end; ++t) {
+                        const auto &config_i = configAt(paths[i], t);
+                        const auto &config_j = configAt(paths[j], t);
+                        if (!isValidPair(*robots[i], config_i, *robots[j],
+                                         config_j)) {
+                            valid = false;
+                        }
+                    }
+                }
+            }
+            return valid;
+        }
+
         if (options.check_environment) {
             for (std::size_t i = 0; i < paths.size(); ++i) {
                 if (effective_starts[i] >= end)
@@ -1641,10 +1845,9 @@ private:
                             "Process-parallel FCL conflict finder result read "
                             "failed");
                     }
-                    if (options.temporary_conflict_find_instrumentation) {
-                        // TEMP(ablation): remove this accumulation once the
-                        // conflict-detection timing table has been reproduced.
-                        options.temporary_conflict_find_instrumentation
+                    if (options.conflict_find_timing_instrumentation) {
+                        // Accumulate per-worker timings for planner metrics.
+                        options.conflict_find_timing_instrumentation
                             ->recordWorkerResult(
                                 worker_index,
                                 result.build_worker_wall_seconds,
@@ -1826,6 +2029,7 @@ private:
     std::vector<CollisionGeometryPtr> env_geoms_;
     std::vector<Transform3> env_transforms_;
     mutable std::unordered_map<const RobotModel *, RobotPrimCache> robot_cache_;
+    mutable ValidationWorkStats last_work_stats_;
 };
 
 } // namespace

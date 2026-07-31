@@ -228,6 +228,10 @@ struct CollisionBackend {
         return {};
     }
 
+    virtual ValidationWorkStats lastValidationWorkStats() const {
+        return {};
+    }
+
     virtual void onEnvironmentChanged(
         const std::vector<ObstacleSphere> &spheres,
         const std::vector<ObstacleCylinder> &cylinders) = 0;

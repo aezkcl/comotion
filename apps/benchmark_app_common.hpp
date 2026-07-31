@@ -40,6 +40,53 @@ namespace comotion::benchmark_apps::common {
 
 using json = nlohmann::json;
 
+inline json validationWorkStatsJson(const comotion::ValidationWorkStats &stats) {
+    return {
+        {"motion_timesteps_possible", stats.motion_timesteps_possible},
+        {"motion_timesteps_checked", stats.motion_timesteps_checked},
+        {"robot_state_checks_possible", stats.robot_state_checks_possible},
+        {"robot_state_checks_completed", stats.robot_state_checks_completed},
+        {"robot_pair_checks_possible", stats.robot_pair_checks_possible},
+        {"robot_pair_checks_completed", stats.robot_pair_checks_completed},
+        {"simd_packs_checked", stats.simd_packs_checked},
+        {"simd_lanes_checked", stats.simd_lanes_checked},
+    };
+}
+
+inline json
+validationTimingStatsJson(const comotion::ValidationTimingStats &stats) {
+    return {
+        {"total_validation_time_seconds",
+         stats.total_validation_time_seconds},
+        {"total_validation_calls", stats.total_validation_calls},
+        {"composite_state_seconds", stats.composite_state_seconds},
+        {"composite_state_calls", stats.composite_state_calls},
+        {"pair_path_seconds", stats.pair_path_seconds},
+        {"pair_path_calls", stats.pair_path_calls},
+        {"pair_path_conflict_seconds", stats.pair_path_conflict_seconds},
+        {"pair_path_conflict_calls", stats.pair_path_conflict_calls},
+        {"goal_hold_constraint_seconds", stats.goal_hold_constraint_seconds},
+        {"goal_hold_constraint_calls", stats.goal_hold_constraint_calls},
+        {"composite_motion_seconds", stats.composite_motion_seconds},
+        {"composite_motion_calls", stats.composite_motion_calls},
+        {"composite_motion_conflict_seconds",
+         stats.composite_motion_conflict_seconds},
+        {"composite_motion_conflict_calls",
+         stats.composite_motion_conflict_calls},
+        {"composite_paths_seconds", stats.composite_paths_seconds},
+        {"composite_paths_calls", stats.composite_paths_calls},
+        {"composite_path_conflict_seconds",
+         stats.composite_path_conflict_seconds},
+        {"composite_path_conflict_calls",
+         stats.composite_path_conflict_calls},
+        {"inter_robot_path_conflicts_scan_seconds",
+         stats.inter_robot_path_conflicts_scan_seconds},
+        {"inter_robot_path_conflicts_scan_calls",
+         stats.inter_robot_path_conflicts_scan_calls},
+        {"work", validationWorkStatsJson(stats.work)},
+    };
+}
+
 struct TrialMetrics {
     std::string planner;
     std::string collision_backend;
@@ -49,6 +96,7 @@ struct TrialMetrics {
     double solve_time_seconds = 0.0;
     double compute_time_seconds = 0.0;
     double validation_time_seconds = 0.0;
+    comotion::ValidationTimingStats validation_timing_stats;
     json sum_of_cost_timesteps = nullptr;
     json makespan_timesteps = nullptr;
     json planner_stats = json::object();
@@ -66,6 +114,8 @@ struct TrialMetrics {
             {"compute_time_seconds", compute_time_seconds},
             {"validation_time_seconds", validation_time_seconds},
             {"sum_of_cost_timesteps", sum_of_cost_timesteps},
+            {"validation_timing",
+             validationTimingStatsJson(validation_timing_stats)},
             {"makespan_timesteps", makespan_timesteps},
             {"planner_stats", planner_stats},
             {"benchmark_context", benchmark_context},
@@ -73,6 +123,38 @@ struct TrialMetrics {
         };
     }
 };
+
+inline void resetValidationTimingForSolve() {
+    comotion::CollisionChecker::resetValidationTimingStats();
+}
+
+inline void captureValidationTimingForSolve(TrialMetrics &metrics) {
+    metrics.validation_timing_stats =
+        comotion::CollisionChecker::validationTimingStats();
+    metrics.validation_time_seconds =
+        metrics.validation_timing_stats.total_validation_time_seconds;
+}
+
+inline json drrtLocalConnectorSummary(const TrialMetrics &metrics) {
+    if (!metrics.planner_stats.is_object() ||
+        !metrics.planner_stats.contains("local_connector_mode")) {
+        return nullptr;
+    }
+    return {
+        {"mode", metrics.planner_stats["local_connector_mode"]},
+        {"attempts",
+         metrics.planner_stats.value("local_connector_attempts",
+                                     std::uint64_t{0})},
+        {"successes",
+         metrics.planner_stats.value("local_connector_successes",
+                                     std::uint64_t{0})},
+        {"used_for_solution",
+         metrics.planner_stats.value("solution_used_local_connector", false)},
+        {"priority_order",
+         metrics.planner_stats.value("solution_local_connector_priority_order",
+                                     std::vector<int>{})},
+    };
+}
 
 struct ProcessCpuUsageSnapshot {
     double self_seconds = 0.0;
@@ -163,6 +245,66 @@ inline std::string lowerAscii(std::string value) {
     return value;
 }
 
+inline comotion::ARC::ExpansionPolicy
+parseArcExpansionPolicy(const std::string &value) {
+    const std::string lowered = lowerAscii(value);
+    if (lowered == "linear")
+        return comotion::ARC::ExpansionPolicy::Linear;
+    if (lowered == "logarithmic" || lowered == "log")
+        return comotion::ARC::ExpansionPolicy::Logarithmic;
+    if (lowered == "exponential" || lowered == "exp")
+        return comotion::ARC::ExpansionPolicy::Exponential;
+    if (lowered == "multiplied" || lowered == "custom" ||
+        lowered == "custom_multiplied") {
+        return comotion::ARC::ExpansionPolicy::CustomMultiplied;
+    }
+    throw std::runtime_error("Unknown ARC expansion policy: " + value);
+}
+
+inline std::vector<double>
+parseArcExpansionMultipliers(const std::string &value) {
+    std::vector<double> multipliers;
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        const std::size_t end = value.find(',', begin);
+        const std::size_t count =
+            end == std::string::npos ? std::string::npos : end - begin;
+        std::string token = value.substr(begin, count);
+        const auto first = token.find_first_not_of(" \t\r\n");
+        const auto last = token.find_last_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            throw std::runtime_error(
+                "ARC expansion multipliers must not contain empty values");
+        }
+        token = token.substr(first, last - first + 1);
+
+        std::size_t consumed = 0;
+        double multiplier = 0.0;
+        try {
+            multiplier = std::stod(token, &consumed);
+        } catch (const std::exception &) {
+            throw std::runtime_error(
+                "Invalid ARC expansion multiplier: " + token);
+        }
+        if (consumed != token.size() || !std::isfinite(multiplier) ||
+            multiplier <= 0.0) {
+            throw std::runtime_error(
+                "ARC expansion multipliers must be finite and positive: " +
+                token);
+        }
+        multipliers.push_back(multiplier);
+
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    if (multipliers.empty()) {
+        throw std::runtime_error(
+            "ARC expansion multiplier sequence must not be empty");
+    }
+    return multipliers;
+}
+
 inline bool parseBoolValue(const std::string &value) {
     const std::string lowered = lowerAscii(value);
     if (lowered == "1" || lowered == "true" || lowered == "yes" ||
@@ -209,6 +351,60 @@ std::string parallelArcConflictBatchModeValue(const Options &options) {
     return parallelArcConflictBatchModeValueImpl(options, 0);
 }
 
+inline std::string normalizedVampValidationStrategyName(std::string value) {
+    value = lowerAscii(std::move(value));
+    std::replace(value.begin(), value.end(), '-', '_');
+    std::replace(value.begin(), value.end(), ' ', '_');
+    const std::string prefix = "vamp_";
+    if (value.rfind(prefix, 0) == 0)
+        value.erase(0, prefix.size());
+    return value;
+}
+
+inline comotion::VampValidationStrategy
+parseVampValidationStrategy(const std::string &value) {
+    const std::string normalized = normalizedVampValidationStrategyName(value);
+    using comotion::VampBatchOrdering;
+    using comotion::VampBatchPacking;
+
+    if (normalized == "combined_rake")
+        return {VampBatchOrdering::Combined, VampBatchPacking::Rake};
+    if (normalized == "combined_linear")
+        return {VampBatchOrdering::Combined, VampBatchPacking::Linear};
+    if (normalized == "hierarchical_rake")
+        return {VampBatchOrdering::Hierarchical, VampBatchPacking::Rake};
+    if (normalized == "hierarchical_linear")
+        return {VampBatchOrdering::Hierarchical, VampBatchPacking::Linear};
+
+    throw std::runtime_error(
+        "Unknown VAMP validation strategy: " + value +
+        " (expected combined_rake, combined_linear, hierarchical_rake, "
+        "or hierarchical_linear)");
+}
+
+inline std::string
+vampValidationStrategyName(const comotion::VampValidationStrategy &strategy) {
+    std::string out =
+        strategy.ordering == comotion::VampBatchOrdering::Combined
+            ? "combined"
+            : "hierarchical";
+    out += "_";
+    out += strategy.packing == comotion::VampBatchPacking::Linear ? "linear"
+                                                                 : "rake";
+    return out;
+}
+
+inline void applyVampValidationStrategy(comotion::CollisionChecker &checker,
+                                        const std::string &value) {
+    checker.setVampValidationStrategy(parseVampValidationStrategy(value));
+}
+
+inline void applyVampValidationStrategy(
+    const std::shared_ptr<comotion::MultiRobotProblem> &problem,
+    const std::string &value) {
+    applyVampValidationStrategy(problem->collisionChecker(), value);
+}
+
 inline comotion::StrrtRewiring parseStrrtRewiring(const std::string &value) {
     const std::string lowered = lowerAscii(value);
     if (lowered == "off")
@@ -244,6 +440,21 @@ parseDrrtTensorSearchMode(const std::string &value) {
         value == "lazy_a_star" || value == "lazy-astar")
         return comotion::MRdRRT::TensorSearchMode::LazyAStar;
     throw std::runtime_error("Unknown dRRT tensor search mode: " + value);
+}
+
+inline comotion::MRdRRT::LocalConnectorMode
+parseDrrtLocalConnectorMode(const std::string &value) {
+    const std::string lowered = lowerAscii(value);
+    if (lowered == "prioritized" || lowered == "paper" ||
+        lowered == "paper_prioritized" || lowered == "paper-prioritized") {
+        return comotion::MRdRRT::LocalConnectorMode::PaperPrioritized;
+    }
+    if (lowered == "synchronized" || lowered == "synchronised" ||
+        lowered == "direct" || lowered == "straight_line" ||
+        lowered == "straight-line") {
+        return comotion::MRdRRT::LocalConnectorMode::Synchronized;
+    }
+    throw std::runtime_error("Unknown dRRT local connector mode: " + value);
 }
 
 inline void writeJson(const json &doc, const std::filesystem::path &path,
@@ -477,6 +688,8 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setExpansionStep(options.arc_expansion_step);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
+            planner->setLocalCompositeRrtRange(
+                options.arc_local_composite_range);
             planner->setLocalCompositeRrtUseMakespanMetric(
                 options.arc_local_composite_use_makespan_metric);
             planner->setLocalSolverMode(
@@ -490,8 +703,22 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setSimplifyConflictSolutions(
                 options.arc_simplify_conflict_solutions);
             planner->setUseCspaceBounds(true);
-            planner->setCspaceBoundMargin(2.0f);
-            planner->setMinCspaceBoundRange(2.0);
+            planner->setCspaceBoundMargin(
+                static_cast<float>(options.arc_cspace_bound_margin));
+            planner->setMinCspaceBoundRange(
+                options.arc_min_cspace_bound_range);
+            planner->setPathSimplificationOptions(
+                {options.arc_simplification_max_shortcut_steps,
+                 options.arc_simplification_max_empty_steps,
+                 options.arc_simplification_max_smooth_steps,
+                 options.arc_simplification_max_passes});
+            if (options.arc_conflict_simplification_options_explicit) {
+                planner->setConflictPathSimplificationOptions(
+                    {options.arc_conflict_simplification_max_shortcut_steps,
+                     options.arc_conflict_simplification_max_empty_steps,
+                     options.arc_conflict_simplification_max_smooth_steps,
+                     options.arc_conflict_simplification_max_passes});
+            }
             return planner;
         };
         return blueprint;
@@ -507,6 +734,8 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setCostMetric(parseDrrtCostMetric(options.drrt_cost_metric));
             planner->setTensorSearchMode(
                 parseDrrtTensorSearchMode(options.drrt_tensor_search));
+            planner->setLocalConnectorMode(
+                parseDrrtLocalConnectorMode(options.drrt_local_connector));
             planner->setExcludeRoadmapBuildTimeFromBudget(
                 options.drrt_exclude_roadmap_build_time);
             return planner;
@@ -525,6 +754,8 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setCostMetric(parseDrrtCostMetric(options.drrt_cost_metric));
             planner->setTensorSearchMode(
                 parseDrrtTensorSearchMode(options.drrt_tensor_search));
+            planner->setLocalConnectorMode(
+                parseDrrtLocalConnectorMode(options.drrt_local_connector));
             planner->setExcludeRoadmapBuildTimeFromBudget(
                 options.drrt_exclude_roadmap_build_time);
             return planner;
@@ -539,8 +770,31 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             auto planner = std::make_shared<comotion::ARC>();
             planner->setInitialWindow(options.arc_initial_window);
             planner->setExpansionStep(options.arc_expansion_step);
+            planner->setExpansionPolicy(
+                parseArcExpansionPolicy(options.arc_expansion_policy));
+            planner->setCustomExpansionMultipliers(
+                parseArcExpansionMultipliers(
+                    options.arc_expansion_multipliers));
+            if (options.arc_initial_valid_expansion_policy) {
+                planner->setInitialValidWindowExpansionPolicy(
+                    parseArcExpansionPolicy(
+                        *options.arc_initial_valid_expansion_policy));
+            }
+            if (options.arc_initial_valid_expansion_step) {
+                planner->setInitialValidWindowExpansionStep(
+                    *options.arc_initial_valid_expansion_step);
+            }
+            if (options.arc_initial_valid_expansion_multipliers) {
+                planner->setInitialValidWindowExpansionMultipliers(
+                    parseArcExpansionMultipliers(
+                        *options.arc_initial_valid_expansion_multipliers));
+            }
+            planner->setInitialValidWindowExpansionSymmetric(
+                options.arc_initial_valid_expansion_symmetric);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
+            planner->setLocalCompositeRrtRange(
+                options.arc_local_composite_range);
             planner->setLocalCompositeRrtUseMakespanMetric(
                 options.arc_local_composite_use_makespan_metric);
             planner->setLocalSolverMode(
@@ -552,8 +806,22 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setSimplifyConflictSolutions(
                 options.arc_simplify_conflict_solutions);
             planner->setUseCspaceBounds(true);
-            planner->setCspaceBoundMargin(2.0f);
-            planner->setMinCspaceBoundRange(2.0);
+            planner->setCspaceBoundMargin(
+                static_cast<float>(options.arc_cspace_bound_margin));
+            planner->setMinCspaceBoundRange(
+                options.arc_min_cspace_bound_range);
+            planner->setPathSimplificationOptions(
+                {options.arc_simplification_max_shortcut_steps,
+                 options.arc_simplification_max_empty_steps,
+                 options.arc_simplification_max_smooth_steps,
+                 options.arc_simplification_max_passes});
+            if (options.arc_conflict_simplification_options_explicit) {
+                planner->setConflictPathSimplificationOptions(
+                    {options.arc_conflict_simplification_max_shortcut_steps,
+                     options.arc_conflict_simplification_max_empty_steps,
+                     options.arc_conflict_simplification_max_smooth_steps,
+                     options.arc_conflict_simplification_max_passes});
+            }
             return planner;
         };
         return blueprint;
@@ -568,6 +836,8 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setExpansionStep(options.arc_expansion_step);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
+            planner->setLocalCompositeRrtRange(
+                options.arc_local_composite_range);
             planner->setLocalCompositeRrtUseMakespanMetric(
                 options.arc_local_composite_use_makespan_metric);
             planner->setLocalSolverMode(
@@ -579,8 +849,22 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             planner->setSimplifyConflictSolutions(
                 options.arc_simplify_conflict_solutions);
             planner->setUseCspaceBounds(true);
-            planner->setCspaceBoundMargin(2.0f);
-            planner->setMinCspaceBoundRange(2.0);
+            planner->setCspaceBoundMargin(
+                static_cast<float>(options.arc_cspace_bound_margin));
+            planner->setMinCspaceBoundRange(
+                options.arc_min_cspace_bound_range);
+            planner->setPathSimplificationOptions(
+                {options.arc_simplification_max_shortcut_steps,
+                 options.arc_simplification_max_empty_steps,
+                 options.arc_simplification_max_smooth_steps,
+                 options.arc_simplification_max_passes});
+            if (options.arc_conflict_simplification_options_explicit) {
+                planner->setConflictPathSimplificationOptions(
+                    {options.arc_conflict_simplification_max_shortcut_steps,
+                     options.arc_conflict_simplification_max_empty_steps,
+                     options.arc_conflict_simplification_max_smooth_steps,
+                     options.arc_conflict_simplification_max_passes});
+            }
             planner->setWorkerProcesses(options.parallel_arc_worker_processes);
             planner->setParallelizeInitialIndividualPlans(
                 options.parallel_arc_parallel_initial_plans);

@@ -1,7 +1,108 @@
 #include "comotion/collision/CollisionChecker.h"
 #include "comotion/collision/detail/CollisionBackend.h"
 
+#include <chrono>
+#include <mutex>
+#include <utility>
+
 namespace comotion {
+
+namespace {
+
+using TraceClock = std::chrono::steady_clock;
+
+enum class ValidationTimingOp {
+    CompositeState,
+    PairPath,
+    PairPathConflict,
+    GoalHoldConstraint,
+    CompositeMotion,
+    CompositeMotionConflict,
+    CompositePaths,
+    CompositePathConflict,
+    InterRobotPathConflictsScan,
+};
+
+std::mutex g_validation_timing_mutex;
+ValidationTimingStats g_validation_timing_stats;
+
+std::uint64_t traceElapsedNanoseconds(TraceClock::time_point start) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            TraceClock::now() - start)
+            .count());
+}
+
+void addValidationTiming(ValidationTimingOp op, double seconds,
+                         const ValidationWorkStats &work) {
+    std::lock_guard<std::mutex> lock(g_validation_timing_mutex);
+    g_validation_timing_stats.total_validation_time_seconds += seconds;
+    ++g_validation_timing_stats.total_validation_calls;
+    g_validation_timing_stats.work += work;
+
+    switch (op) {
+    case ValidationTimingOp::CompositeState:
+        g_validation_timing_stats.composite_state_seconds += seconds;
+        ++g_validation_timing_stats.composite_state_calls;
+        break;
+    case ValidationTimingOp::PairPath:
+        g_validation_timing_stats.pair_path_seconds += seconds;
+        ++g_validation_timing_stats.pair_path_calls;
+        break;
+    case ValidationTimingOp::PairPathConflict:
+        g_validation_timing_stats.pair_path_conflict_seconds += seconds;
+        ++g_validation_timing_stats.pair_path_conflict_calls;
+        break;
+    case ValidationTimingOp::GoalHoldConstraint:
+        g_validation_timing_stats.goal_hold_constraint_seconds += seconds;
+        ++g_validation_timing_stats.goal_hold_constraint_calls;
+        break;
+    case ValidationTimingOp::CompositeMotion:
+        g_validation_timing_stats.composite_motion_seconds += seconds;
+        ++g_validation_timing_stats.composite_motion_calls;
+        break;
+    case ValidationTimingOp::CompositeMotionConflict:
+        g_validation_timing_stats.composite_motion_conflict_seconds += seconds;
+        ++g_validation_timing_stats.composite_motion_conflict_calls;
+        break;
+    case ValidationTimingOp::CompositePaths:
+        g_validation_timing_stats.composite_paths_seconds += seconds;
+        ++g_validation_timing_stats.composite_paths_calls;
+        break;
+    case ValidationTimingOp::CompositePathConflict:
+        g_validation_timing_stats.composite_path_conflict_seconds += seconds;
+        ++g_validation_timing_stats.composite_path_conflict_calls;
+        break;
+    case ValidationTimingOp::InterRobotPathConflictsScan:
+        g_validation_timing_stats.inter_robot_path_conflicts_scan_seconds +=
+            seconds;
+        ++g_validation_timing_stats.inter_robot_path_conflicts_scan_calls;
+        break;
+    }
+}
+
+class ScopedValidationTiming {
+public:
+    ScopedValidationTiming(ValidationTimingOp op,
+                           const detail::CollisionBackend &backend)
+        : op_(op), backend_(&backend), start_(TraceClock::now()) {}
+
+    ~ScopedValidationTiming() {
+        ValidationWorkStats work;
+        if (backend_)
+            work = backend_->lastValidationWorkStats();
+        const double seconds =
+            std::chrono::duration<double>(TraceClock::now() - start_).count();
+        addValidationTiming(op_, seconds, work);
+    }
+
+private:
+    ValidationTimingOp op_;
+    const detail::CollisionBackend *backend_ = nullptr;
+    TraceClock::time_point start_;
+};
+
+} // namespace
 
 struct CollisionChecker::Impl {
     std::unique_ptr<detail::CollisionBackend> backend;
@@ -35,7 +136,7 @@ CollisionChecker::~CollisionChecker() = default;
 CollisionChecker::CollisionChecker(const CollisionChecker &other)
     : impl_(std::make_unique<Impl>(other.impl_->backend->clone())),
       backend_(other.backend_), obstacles_(other.obstacles_),
-      cylinders_(other.cylinders_) {
+      cylinders_(other.cylinders_), trace_recorder_(other.trace_recorder_) {
     impl_->backend->onEnvironmentChanged(obstacles_, cylinders_);
 }
 
@@ -45,6 +146,7 @@ CollisionChecker &CollisionChecker::operator=(const CollisionChecker &other) {
     backend_ = other.backend_;
     obstacles_ = other.obstacles_;
     cylinders_ = other.cylinders_;
+    trace_recorder_ = other.trace_recorder_;
     impl_ = std::make_unique<Impl>(other.impl_->backend->clone());
     impl_->backend->onEnvironmentChanged(obstacles_, cylinders_);
     return *this;
@@ -76,6 +178,30 @@ VampValidationStrategy CollisionChecker::vampValidationStrategy() const {
     return impl_->backend->vampValidationStrategy();
 }
 
+ValidationWorkStats CollisionChecker::lastValidationWorkStats() const {
+    return impl_->backend->lastValidationWorkStats();
+}
+
+void CollisionChecker::resetValidationTimingStats() {
+    std::lock_guard<std::mutex> lock(g_validation_timing_mutex);
+    g_validation_timing_stats = ValidationTimingStats {};
+}
+
+ValidationTimingStats CollisionChecker::validationTimingStats() {
+    std::lock_guard<std::mutex> lock(g_validation_timing_mutex);
+    return g_validation_timing_stats;
+}
+
+void CollisionChecker::setValidationTraceRecorder(
+    std::shared_ptr<ValidationTraceRecorder> recorder) {
+    trace_recorder_ = std::move(recorder);
+}
+
+std::shared_ptr<ValidationTraceRecorder>
+CollisionChecker::validationTraceRecorder() const {
+    return trace_recorder_;
+}
+
 bool CollisionChecker::isValidSingle(const RobotModel &robot,
                                      const std::vector<double> &config) const {
     return impl_->backend->isValidSingle(robot, config, obstacles_, cylinders_);
@@ -101,16 +227,34 @@ bool CollisionChecker::isValidPair(const RobotModel &robot_a,
 bool CollisionChecker::isValidComposite(
     const std::vector<const RobotModel *> &robots,
     const std::vector<std::vector<double>> &configs) const {
+    const ScopedValidationTiming timer(ValidationTimingOp::CompositeState,
+                                       *impl_->backend);
+    const auto start = trace_recorder_ ? TraceClock::now()
+                                       : TraceClock::time_point{};
     int n = static_cast<int>(robots.size());
     for (int i = 0; i < n; ++i) {
-        if (!isValidSingleFull(*robots[i], configs[i]))
+        if (!isValidSingleFull(*robots[i], configs[i])) {
+            if (trace_recorder_) {
+                trace_recorder_->recordCompositeState(
+                    configs, false, traceElapsedNanoseconds(start));
+            }
             return false;
+        }
     }
     for (int i = 0; i < n; ++i) {
         for (int j = i + 1; j < n; ++j) {
-            if (!isValidPair(*robots[i], configs[i], *robots[j], configs[j]))
+            if (!isValidPair(*robots[i], configs[i], *robots[j], configs[j])) {
+                if (trace_recorder_) {
+                    trace_recorder_->recordCompositeState(
+                        configs, false, traceElapsedNanoseconds(start));
+                }
                 return false;
+            }
         }
+    }
+    if (trace_recorder_) {
+        trace_recorder_->recordCompositeState(
+            configs, true, traceElapsedNanoseconds(start));
     }
     return true;
 }
@@ -133,6 +277,8 @@ bool CollisionChecker::isPairPathValid(
     const RobotModel &robot_a, const Path &path_a,
     const RobotModel &robot_b, const Path &path_b,
     std::size_t t_begin, std::size_t t_end) const {
+    const ScopedValidationTiming timer(ValidationTimingOp::PairPath,
+                                       *impl_->backend);
     return impl_->backend->isPairPathValid(robot_a, path_a, robot_b, path_b,
                                            t_begin, t_end);
 }
@@ -141,6 +287,8 @@ std::optional<PairPathConflict> CollisionChecker::findFirstPairPathConflict(
     const RobotModel &robot_a, const Path &path_a,
     const RobotModel &robot_b, const Path &path_b,
     std::size_t t_begin, std::size_t t_end) const {
+    const ScopedValidationTiming timer(ValidationTimingOp::PairPathConflict,
+                                       *impl_->backend);
     return impl_->backend->findFirstPairPathConflict(
         robot_a, path_a, robot_b, path_b, t_begin, t_end);
 }
@@ -150,6 +298,8 @@ GoalHoldConstraint CollisionChecker::computeGoalHoldConstraint(
     const std::vector<double> &goal_config,
     const RobotModel &prior_robot,
     const Path &prior_path) const {
+    const ScopedValidationTiming timer(ValidationTimingOp::GoalHoldConstraint,
+                                       *impl_->backend);
     return impl_->backend->computeGoalHoldConstraint(
         goal_robot, goal_config, prior_robot, prior_path);
 }
@@ -159,8 +309,19 @@ bool CollisionChecker::isCompositeMotionValid(
     const std::vector<std::vector<double>> &from,
     const std::vector<std::vector<double>> &to,
     const CompositePathValidationOptions &options) const {
-    return impl_->backend->isCompositeMotionValid(robots, from, to, options,
-                                                  obstacles_, cylinders_);
+    const ScopedValidationTiming timer(ValidationTimingOp::CompositeMotion,
+                                       *impl_->backend);
+    if (!trace_recorder_) {
+        return impl_->backend->isCompositeMotionValid(robots, from, to, options,
+                                                      obstacles_, cylinders_);
+    }
+
+    const auto start = TraceClock::now();
+    const bool result = impl_->backend->isCompositeMotionValid(
+        robots, from, to, options, obstacles_, cylinders_);
+    trace_recorder_->recordCompositeMotion(
+        from, to, options, result, traceElapsedNanoseconds(start));
+    return result;
 }
 
 std::optional<CompositeConflict>
@@ -169,6 +330,8 @@ CollisionChecker::findFirstCompositeMotionConflict(
     const std::vector<std::vector<double>> &from,
     const std::vector<std::vector<double>> &to,
     const CompositePathValidationOptions &options) const {
+    const ScopedValidationTiming timer(
+        ValidationTimingOp::CompositeMotionConflict, *impl_->backend);
     return impl_->backend->findFirstCompositeMotionConflict(
         robots, from, to, options, obstacles_, cylinders_);
 }
@@ -177,6 +340,8 @@ bool CollisionChecker::validateCompositePaths(
     const std::vector<Path> &paths,
     const std::vector<const RobotModel *> &robots,
     const CompositePathValidationOptions &options) const {
+    const ScopedValidationTiming timer(ValidationTimingOp::CompositePaths,
+                                       *impl_->backend);
     return impl_->backend->validateCompositePaths(paths, robots, options,
                                                   obstacles_, cylinders_);
 }
@@ -187,6 +352,8 @@ CollisionChecker::findFirstCompositePathConflict(
     const std::vector<const RobotModel *> &robots,
     const CompositePathValidationOptions &options,
     std::vector<std::size_t> *next_t_begin_by_robot_out) const {
+    const ScopedValidationTiming timer(ValidationTimingOp::CompositePathConflict,
+                                       *impl_->backend);
     return impl_->backend->findFirstCompositePathConflict(
         paths, robots, options, obstacles_, cylinders_,
         next_t_begin_by_robot_out);
@@ -201,6 +368,8 @@ CollisionChecker::findInterRobotPathConflictsCompositeScan(
     const InterRobotConflictCallback &on_conflict,
     std::vector<std::size_t> *next_t_begin_by_robot_out,
     std::vector<std::size_t> *next_t_begin_by_pair_out) const {
+    const ScopedValidationTiming timer(
+        ValidationTimingOp::InterRobotPathConflictsScan, *impl_->backend);
     return impl_->backend->findInterRobotPathConflictsCompositeScan(
         paths, robots, options, max_conflicts, unique, on_conflict, obstacles_,
         cylinders_, next_t_begin_by_robot_out, next_t_begin_by_pair_out);

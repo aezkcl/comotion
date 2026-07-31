@@ -5,12 +5,14 @@
 #include "comotion/planning/PathSimplification.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace comotion {
@@ -21,6 +23,13 @@ namespace comotion {
 /// iteratively finds and resolves conflicts via local subproblems.
 class ARC : public MultiRobotPlanner {
 public:
+    enum class ExpansionPolicy {
+        Linear,
+        Logarithmic,
+        Exponential,
+        CustomMultiplied,
+    };
+
     enum class LocalSolverMode {
         Both,
         PrioritizedStrrtOnly,
@@ -32,14 +41,105 @@ public:
     std::vector<Path> getSolutionPaths() const override;
     std::string name() const override { return "ARC"; }
 
-    void setInitialWindow(int w) { initial_window_ = w; }
-    void setExpansionStep(int e) { expansion_step_ = e; }
+    void setInitialWindow(int w) { initial_window_ = std::max(1, w); }
+    void setExpansionStep(double e) {
+        expansion_step_ = (std::isfinite(e) && e > 0.0) ? e : 1.0;
+    }
+    /// Temporal-window growth after local-repair failures. For zero-based
+    /// expansion index k, the symmetric half-width is computed from the
+    /// discovered valid base half-width. Linear targets
+    /// base + expansion_step * (k + 1), Logarithmic targets
+    /// base + expansion_step * log2(k + 2), and Exponential targets
+    /// base + expansion_step * 2^k. CustomMultiplied targets
+    /// discovered_valid_half_width * custom_expansion_multipliers[k].
+    ///
+    /// Formula-based policies jump to the global interval when their rounded,
+    /// clipped target repeats the preceding window. Logarithmic also jumps
+    /// globally when both remaining tails are within 10% of the full horizon.
+    /// CustomMultiplied jumps globally after its ordered sequence is exhausted.
+    void setExpansionPolicy(ExpansionPolicy policy) {
+        expansion_policy_ = policy;
+    }
+    ExpansionPolicy expansionPolicy() const { return expansion_policy_; }
+    void setCustomExpansionMultipliers(std::vector<double> multipliers);
+    const std::vector<double> &customExpansionMultipliers() const {
+        return custom_expansion_multipliers_;
+    }
+
+    /// Temporal-window growth used only until a subproblem first has valid
+    /// composite start and goal configurations. Each setting inherits the
+    /// corresponding main expansion setting until explicitly overridden.
+    ///
+    /// Once a valid endpoint window is found, ARC attempts that window before
+    /// starting the main expansion schedule at index zero. The validity phase
+    /// is not re-entered if a later main-expanded window has invalid endpoints.
+    void setInitialValidWindowExpansionStep(double e) {
+        initial_valid_window_expansion_step_ =
+            (std::isfinite(e) && e > 0.0) ? e : 1.0;
+    }
+    void clearInitialValidWindowExpansionStep() {
+        initial_valid_window_expansion_step_.reset();
+    }
+    double initialValidWindowExpansionStep() const {
+        return initial_valid_window_expansion_step_.value_or(expansion_step_);
+    }
+    bool initialValidWindowExpansionStepInheritsMain() const {
+        return !initial_valid_window_expansion_step_.has_value();
+    }
+    void setInitialValidWindowExpansionPolicy(ExpansionPolicy policy) {
+        initial_valid_window_expansion_policy_ = policy;
+    }
+    void clearInitialValidWindowExpansionPolicy() {
+        initial_valid_window_expansion_policy_.reset();
+    }
+    ExpansionPolicy initialValidWindowExpansionPolicy() const {
+        return initial_valid_window_expansion_policy_.value_or(
+            expansion_policy_);
+    }
+    bool initialValidWindowExpansionPolicyInheritsMain() const {
+        return !initial_valid_window_expansion_policy_.has_value();
+    }
+    void setInitialValidWindowExpansionMultipliers(
+        std::vector<double> multipliers);
+    void clearInitialValidWindowExpansionMultipliers() {
+        initial_valid_window_expansion_multipliers_.reset();
+    }
+    const std::vector<double> &
+    initialValidWindowExpansionMultipliers() const {
+        return initial_valid_window_expansion_multipliers_
+            ? *initial_valid_window_expansion_multipliers_
+            : custom_expansion_multipliers_;
+    }
+    bool initialValidWindowExpansionMultipliersInheritMain() const {
+        return !initial_valid_window_expansion_multipliers_.has_value();
+    }
+    /// When true (default), endpoint-validity search expands both temporal
+    /// sides together. When false, only an invalid start side and/or invalid
+    /// goal side is expanded. After both endpoints are valid, all main-policy
+    /// windows are symmetric about the midpoint of the discovered interval.
+    void setInitialValidWindowExpansionSymmetric(bool symmetric) {
+        initial_valid_window_expansion_symmetric_ = symmetric;
+    }
+    bool initialValidWindowExpansionSymmetric() const {
+        return initial_valid_window_expansion_symmetric_;
+    }
 
     /// Cap CompositeRRT (RRTConnect) outer-loop iterations per local solve call when
     /// the temporal window does not yet span the full global horizon. On the final
     /// full-window local call, the cap is ignored (time budget only).
     /// Zero disables the cap for all non-final calls as well.
     void setLocalCompositeRrtMaxSamples(unsigned n) { local_composite_rrt_max_samples_ = n; }
+    /// Maximum RRTConnect extension length for local composite repairs. A
+    /// non-positive value restores OMPL's automatic range selection.
+    void setLocalCompositeRrtRange(double distance) {
+        if (distance > 0.0)
+            local_composite_rrt_range_ = distance;
+        else
+            local_composite_rrt_range_.reset();
+    }
+    std::optional<double> localCompositeRrtRange() const {
+        return local_composite_rrt_range_;
+    }
     void setLocalCompositeRrtUseMakespanMetric(bool v) {
         local_composite_rrt_use_makespan_metric_ = v;
     }
@@ -63,6 +163,14 @@ public:
     }
     PathSimplificationOptions getPathSimplificationOptions() const {
         return simplification_options_;
+    }
+    void setConflictPathSimplificationOptions(
+        PathSimplificationOptions options) {
+        conflict_simplification_options_ =
+            detail::normalizePathSimplificationOptions(options);
+    }
+    void clearConflictPathSimplificationOptions() {
+        conflict_simplification_options_.reset();
     }
     void setSimplificationMaxSteps(unsigned int max_steps) {
         simplification_options_.max_shortcut_steps = std::max(1u, max_steps);
@@ -127,6 +235,8 @@ protected:
         std::uint64_t num_conflicts = 0;
         std::uint64_t subproblem_attempts = 0;
         std::uint64_t temporal_expansions = 0;
+        std::uint64_t initial_valid_temporal_expansions = 0;
+        std::uint64_t main_temporal_expansions = 0;
         double initial_solution_times_seconds_wall_clock = 0.0;
         double initial_solution_times_seconds_cpu = 0.0;
         double initial_simplification_times_seconds_wall_clock = 0.0;
@@ -165,6 +275,55 @@ protected:
         int window_end_t = 0;
         std::vector<int> final_involved_robots;
         std::vector<Path> local_patch_paths;
+    };
+
+    struct ExpansionScheduleState {
+        bool initial_valid_window_established = false;
+        bool last_expansion_used_initial_valid_schedule = false;
+        std::size_t initial_valid_expansion_index = 0;
+        std::size_t main_expansion_index = 0;
+        bool initial_search_geometry_initialized = false;
+        std::int64_t initial_search_center_twice = 0;
+        std::int64_t initial_search_half_width_twice = 0;
+        std::int64_t main_window_center_twice = 0;
+        std::int64_t main_base_half_width_twice = 0;
+    };
+
+    enum class RepairAttemptPhase {
+        InitialWindow,
+        InitialValid,
+        Main,
+    };
+
+    struct RepairAttemptEvent {
+        std::uint64_t repair_id = 0;
+        std::uint64_t attempt_index = 0;
+        int seed_robot_i = -1;
+        int seed_robot_j = -1;
+        int conflict_timestep = 0;
+        std::vector<int> robots;
+        RepairAttemptPhase phase = RepairAttemptPhase::InitialWindow;
+        std::optional<std::size_t> expansion_index;
+        int window_start_t = 0;
+        int window_end_t = 0;
+        std::size_t max_t = 0;
+        // The expansion schedule's explicit global sentinel is [0, max_t].
+        bool effective_global = false;
+        // Solver behavior treats [0, max_t - 1] as spanning every waypoint.
+        bool temporal_full_window = false;
+        bool validity_checked = false;
+        bool start_valid = false;
+        bool goal_valid = false;
+        bool endpoints_valid = false;
+        bool bounded_epsilon_skipped = false;
+        bool prioritized_invoked = false;
+        bool composite_invoked = false;
+        bool solver_invoked = false;
+        bool resolved = false;
+        std::optional<std::int64_t> main_window_center_twice;
+        std::optional<std::int64_t> main_base_half_width_twice;
+        std::string solved_by;
+        std::string outcome = "pending";
     };
 
     struct IndividualPlanResult {
@@ -208,6 +367,50 @@ protected:
                                  bool apply_solution_to_paths = true,
                                  CancellationCallback cancel_requested = {});
 
+    std::pair<int, int>
+    nextExpansionWindow(int start_t, int end_t, std::size_t max_t,
+                        std::size_t expansion_index) const;
+    std::pair<int, int> nextExpansionWindowWithSettings(
+        int start_t, int end_t, std::size_t max_t,
+        std::size_t expansion_index, ExpansionPolicy policy,
+        double expansion_step,
+        const std::vector<double> &custom_multipliers) const;
+    std::pair<int, int>
+    nextInitialValidExpansionWindow(int start_t, int end_t,
+                                    std::size_t max_t,
+                                    std::size_t expansion_index) const;
+    std::pair<int, int> nextInitialValidExpansionWindow(
+        int start_t, int end_t, std::size_t max_t,
+        std::size_t expansion_index, bool start_valid, bool goal_valid,
+        const ExpansionScheduleState &state) const;
+    std::pair<int, int> nextMainExpansionWindow(
+        int start_t, int end_t, std::size_t max_t,
+        std::size_t expansion_index,
+        const ExpansionScheduleState &state) const;
+    std::pair<int, int> nextExpansionWindowAfterAttempt(
+        int start_t, int end_t, std::size_t max_t,
+        bool start_valid, bool goal_valid,
+        ExpansionScheduleState &state) const;
+    std::pair<int, int> nextExpansionWindowAfterAttempt(
+        int start_t, int end_t, std::size_t max_t,
+        bool local_endpoints_valid, ExpansionScheduleState &state) const {
+        return nextExpansionWindowAfterAttempt(
+            start_t, end_t, max_t, local_endpoints_valid,
+            local_endpoints_valid, state);
+    }
+    void establishMainWindowGeometry(int start_t, int end_t,
+                                     ExpansionScheduleState &state) const;
+    std::pair<int, int> symmetricWindowFromGeometry(
+        std::int64_t center_twice, std::int64_t half_width_twice,
+        std::size_t max_t) const;
+    std::pair<int, int> absoluteExpansionWindow(
+        int start_t, int end_t, std::size_t max_t,
+        std::size_t expansion_index, ExpansionPolicy policy,
+        double expansion_step,
+        const std::vector<double> &custom_multipliers,
+        std::int64_t center_twice,
+        std::int64_t base_half_width_twice) const;
+
     // Splice subproblem solution into the global paths
     void spliceSolutionIntoPaths(const std::vector<int> &involved_robots,
                                  int start_t, int end_t,
@@ -235,7 +438,7 @@ protected:
     static double elapsedProcessTreeCpuSeconds(
         const ProcessTreeCpuUsageSnapshot &start,
         const ProcessTreeCpuUsageSnapshot &finish);
-    static nlohmann::json temporaryConflictFindTimingJson(
+    static nlohmann::json conflictFindTimingJson(
         const std::vector<double> &main_process_wall_seconds,
         const std::vector<double> &process_tree_cpu_seconds,
         const std::vector<double> &build_worker_wall_seconds,
@@ -246,6 +449,9 @@ protected:
         const std::vector<double> &critical_worker_build_wall_seconds,
         const std::vector<double> &critical_worker_collision_wall_seconds,
         const std::vector<double> &critical_worker_total_wall_seconds);
+    nlohmann::json repairAttemptEventsJson() const;
+    nlohmann::json conflictResolutionEventsJson() const;
+    nlohmann::json conflictSolveCountsByExpansionStageJson() const;
 
     void initializeConflictScanStarts(std::size_t robot_count);
     CompositePathValidationOptions conflictScanOptions() const;
@@ -292,8 +498,17 @@ protected:
     /// pair_conflict_scan_start_t_ for coarse tracing/stat summaries.
     int last_subproblem_window_start_ = -1;
     int initial_window_ = 20;
-    int expansion_step_ = 20;
+    double expansion_step_ = 20.0;
+    ExpansionPolicy expansion_policy_ = ExpansionPolicy::Linear;
+    std::vector<double> custom_expansion_multipliers_{
+        1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 4.0, 8.0};
+    std::optional<double> initial_valid_window_expansion_step_;
+    std::optional<ExpansionPolicy> initial_valid_window_expansion_policy_;
+    std::optional<std::vector<double>>
+        initial_valid_window_expansion_multipliers_;
+    bool initial_valid_window_expansion_symmetric_ = true;
     unsigned local_composite_rrt_max_samples_{0};
+    std::optional<double> local_composite_rrt_range_;
     bool local_composite_rrt_use_makespan_metric_{false};
     LocalSolverMode local_solver_mode_ = LocalSolverMode::Both;
     unsigned int local_prioritized_strrt_max_iterations_ = 5;
@@ -303,6 +518,7 @@ protected:
     bool simplify_initial_solutions_ = true;
     bool simplify_conflict_solutions_ = false;
     PathSimplificationOptions simplification_options_{};
+    std::optional<PathSimplificationOptions> conflict_simplification_options_;
     std::optional<std::uint64_t> global_makespan_bound_timesteps_;
     std::uint64_t bounded_local_repair_epsilon_timesteps_ = 1;
     bool warned_bounded_prioritized_disabled_ = false;
@@ -311,29 +527,33 @@ protected:
     std::uint64_t num_conflicts_ = 0;
     std::uint64_t num_subproblem_attempts_ = 0;
     std::uint64_t num_temporal_expansions_ = 0;
+    std::uint64_t num_initial_valid_temporal_expansions_ = 0;
+    std::uint64_t num_main_temporal_expansions_ = 0;
+    std::uint64_t next_repair_attempt_id_ = 0;
+    std::vector<RepairAttemptEvent> repair_attempt_events_;
     double initial_solution_times_seconds_wall_clock_ = 0.0;
     double initial_solution_times_seconds_cpu_ = 0.0;
     double initial_simplification_times_seconds_wall_clock_ = 0.0;
     double local_composite_simplification_times_seconds_wall_clock_ = 0.0;
     std::vector<double> conflict_detection_times_seconds_;
     std::vector<double> conflict_detection_times_cpu_seconds_;
-    // TEMP(ablation): remove these once the conflict-detection table
-    // reproduction no longer needs per-round worker build/collision timing.
-    std::vector<double> temporary_conflict_find_main_process_wall_seconds_;
-    std::vector<double> temporary_conflict_find_process_tree_cpu_seconds_;
-    std::vector<double> temporary_conflict_find_build_worker_wall_seconds_;
-    std::vector<double> temporary_conflict_find_build_worker_cpu_seconds_;
-    std::vector<double> temporary_conflict_find_collision_worker_wall_seconds_;
-    std::vector<double> temporary_conflict_find_collision_worker_cpu_seconds_;
-    std::vector<int> temporary_conflict_find_critical_worker_index_;
-    std::vector<double> temporary_conflict_find_critical_worker_build_wall_seconds_;
+    // Per-round conflict-search timing reported by plannerStatsJson().
+    std::vector<double> conflict_find_main_process_wall_seconds_;
+    std::vector<double> conflict_find_process_tree_cpu_seconds_;
+    std::vector<double> conflict_find_build_worker_wall_seconds_;
+    std::vector<double> conflict_find_build_worker_cpu_seconds_;
+    std::vector<double> conflict_find_collision_worker_wall_seconds_;
+    std::vector<double> conflict_find_collision_worker_cpu_seconds_;
+    std::vector<int> conflict_find_critical_worker_index_;
+    std::vector<double> conflict_find_critical_worker_build_wall_seconds_;
     std::vector<double>
-        temporary_conflict_find_critical_worker_collision_wall_seconds_;
-    std::vector<double> temporary_conflict_find_critical_worker_total_wall_seconds_;
+        conflict_find_critical_worker_collision_wall_seconds_;
+    std::vector<double> conflict_find_critical_worker_total_wall_seconds_;
     std::vector<double> conflict_resolution_times_seconds_;
     std::vector<double> conflict_resolution_times_cpu_seconds_;
 };
 
 using ArcLocalSolverMode = ARC::LocalSolverMode;
+using ArcExpansionPolicy = ARC::ExpansionPolicy;
 
 } // namespace comotion

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <limits>
 #include <random>
+#include <stdexcept>
 
 namespace ob = ompl::base;
 namespace og = ompl::geometric;
@@ -180,8 +181,35 @@ ompl::base::PlannerStatus PrioritizedSTRRT::solve(double timeLimit) {
     solution_paths_.clear();
     last_robot_solve_times_seconds_.clear();
     int n = problem_->numRobots();
-    std::vector<int> order = priority_order_;
-    if (shuffle_priority_order_ || order.empty()) {
+    std::vector<int> order;
+    if (!priority_groups_.empty()) {
+        std::vector<bool> seen(static_cast<std::size_t>(n), false);
+        std::mt19937 rng(planning_seed_);
+        for (const auto &group : priority_groups_) {
+            std::vector<int> group_order = group;
+            if (shuffle_priority_order_)
+                std::shuffle(group_order.begin(), group_order.end(), rng);
+            for (const int robot : group_order) {
+                if (robot < 0 || robot >= n ||
+                    seen[static_cast<std::size_t>(robot)]) {
+                    throw std::runtime_error(
+                        "PrioritizedSTRRT priority groups must contain each "
+                        "robot exactly once");
+                }
+                seen[static_cast<std::size_t>(robot)] = true;
+                order.push_back(robot);
+            }
+        }
+        if (order.size() != static_cast<std::size_t>(n)) {
+            throw std::runtime_error(
+                "PrioritizedSTRRT priority groups must contain each robot "
+                "exactly once");
+        }
+    } else {
+        order = priority_order_;
+    }
+    if (priority_groups_.empty() &&
+        (shuffle_priority_order_ || order.empty())) {
         order.clear();
         for (int i = 0; i < n; ++i)
             order.push_back(i);
@@ -193,6 +221,7 @@ ompl::base::PlannerStatus PrioritizedSTRRT::solve(double timeLimit) {
     const auto finalizePlannerStats = [&]() {
         nlohmann::json stats = nlohmann::json::object();
         stats["priority_order"] = order;
+        stats["priority_groups"] = priority_groups_;
         stats["shuffle_priority_order"] = shuffle_priority_order_;
         stats["return_first_solution"] = return_first_solution_;
         stats["strrt_rewiring"] = strrtRewiringName(strrt_rewiring_);

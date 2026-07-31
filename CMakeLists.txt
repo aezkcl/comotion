@@ -275,24 +275,45 @@ install(FILES
     BENCHMARKS.md
     EXAMPLES.md
     RELEASE_CHECKLIST.md
+    THIRD_PARTY_NOTICES.md
     LICENSE
     CITATION.cff
   DESTINATION "${CMAKE_INSTALL_DOCDIR}")
+
+install(DIRECTORY LICENSES/
+  DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
 
 install(PROGRAMS
     benchmarks/scripts/benchmark_runner_common.py
     benchmarks/scripts/run_feasibility.py
     benchmarks/scripts/run_anytime.py
     benchmarks/scripts/run_multicore.py
+    benchmarks/scripts/plot_results.py
+    benchmarks/scripts/run_planner_trials.py
+    benchmarks/scripts/run_param_sweep.py
   DESTINATION "${CMAKE_INSTALL_DATADIR}/comotion/benchmarks/scripts")
+
+install(FILES
+    benchmarks/configs/planner_trial_params.json
+    benchmarks/configs/heterogenous_param_sweep.json
+    benchmarks/configs/scenario_planner_param_sweep_8seed.json
+    benchmarks/configs/scenario_planner_params_8seed.json
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/comotion/benchmarks/configs")
 
 install(FILES resources/README.md
   DESTINATION "${CMAKE_INSTALL_DATADIR}/comotion/resources")
 
 install(FILES
+    resources/panda/panda.urdf
     resources/panda/panda_spherized.urdf
     resources/panda/panda.srdf
   DESTINATION "${CMAKE_INSTALL_DATADIR}/comotion/resources/panda")
+
+install(DIRECTORY resources/panda/meshes
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/comotion/resources/panda")
+
+install(DIRECTORY resources/benchmarks
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/comotion/resources")
 
 install(FILES
     resources/planar3/planar3.urdf
@@ -310,10 +331,21 @@ set(CPACK_SOURCE_IGNORE_FILES
   "/\\\\.agents/"
   "/\\\\.codex/"
   "/build[^/]*/"
+  "/_CPack_Packages/"
+  "/CoMotion-.*-Source\\\\.tar\\\\.gz$"
   "/src/comotion/benchmark/"
   "/results/"
   "/benchmarks/results/"
-  "/resources/panda/meshes/"
+  "/papers/"
+  "/video/"
+  "/viewer/data/"
+  "/[^/]*\\\\.csv$"
+  "/benchmarks/configs/panda_cage_n8_arc_(custom|expansion|exponential|initial|linear|log|tuning).*\\\\.json$"
+  "/benchmarks/scripts/.*_07_.*\\\\.py$"
+  "/benchmarks/scripts/run_.*_campaign_.*\\\\.py$"
+  "/benchmarks/scripts/analyze_arc_conflict_timings\\\\.py$"
+  "/benchmarks/scripts/export_validation_chunk_csv\\\\.py$"
+  "/benchmarks/scripts/plot_arc_runtime_.*\\\\.py$"
   "/external/como-ompl/scripts/benchmark\\\\.db$"
   "/external/como-ompl/scripts/docker/"
   "/external/como-ompl/scripts/ompl_benchmark_statistics\\\\.py$"

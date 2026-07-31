@@ -243,6 +243,34 @@ CASE_CATALOG: dict[str, BenchmarkCase] = {
         base_args=("--num-robots", "4"),
         task_based=True,
     ),
+    "heterogeneous_corridor_p4_s8": BenchmarkCase(
+        key="heterogeneous_corridor_p4_s8",
+        title="Heterogeneous corridor, 4 Pandas + 8 spheres",
+        executable="heterogeneous_corridor",
+        base_args=("--num-pandas", "4", "--num-spheres", "8"),
+        task_based=True,
+    ),
+    "heterogeneous_corridor_p8_s16": BenchmarkCase(
+        key="heterogeneous_corridor_p8_s16",
+        title="Heterogeneous corridor, 8 Pandas + 16 spheres",
+        executable="heterogeneous_corridor",
+        base_args=("--num-pandas", "8", "--num-spheres", "16"),
+        task_based=True,
+    ),
+    "heterogeneous_corridor_p16_s32": BenchmarkCase(
+        key="heterogeneous_corridor_p16_s32",
+        title="Heterogeneous corridor, 16 Pandas + 32 spheres",
+        executable="heterogeneous_corridor",
+        base_args=(
+            "--num-pandas",
+            "16",
+            "--num-spheres",
+            "32",
+            "--panda-spacing",
+            "1.5",
+        ),
+        task_based=True,
+    ),
 }
 
 DEFAULT_FEASIBILITY_CASES = ("mobile_parallel_n4", "planar_cross_n4", "panda_cage_n2")
@@ -314,18 +342,18 @@ PLANNER_LABELS = {
     "arc": "ARC",
     "ao_arc": "AOARC",
     "parallel_arc": "ParallelARC",
-    "composite": "CompositeRRT",
+    "composite": "Composite RRT-C",
     "composite_rrtstar": "CompositeRRTStar",
     "composite_rrt_star": "CompositeRRTStar",
     "composite_prmstar": "CompositePRMStar",
     "composite_prm_star": "CompositePRMStar",
     "composite_aorrtc": "CompositeAORRTC",
     "cooperative_composite": "CooperativeCompositeRRT",
-    "prioritized": "PrioritizedSTRRT",
-    "drrt": "MRdRRT",
+    "prioritized": "PP-ST-RRT",
+    "drrt": "MR-dRRT",
     "drrt_star": "MRdRRTStar",
     "ao_drrt": "MRdRRTStar",
-    "stcbs": "STCBS",
+    "stcbs": "ST-CBS",
 }
 
 RESULT_COLUMNS = [
@@ -334,6 +362,7 @@ RESULT_COLUMNS = [
     "task_index",
     "seed",
     "method",
+    "collision_backend",
     "time_limit_seconds",
     "success",
     "first_solution_time_seconds",
@@ -348,11 +377,24 @@ EVENT_COLUMNS = [
     "task_index",
     "seed",
     "method",
+    "collision_backend",
     "elapsed_seconds",
     "makespan_timesteps",
 ]
 
-METHOD_COLORS = [
+METHOD_COLOR_BY_LABEL = {
+    "ARC": "#7b2cbf",
+    "Composite RRT-C": "#4169e1",
+    "CompositeRRT": "#4169e1",
+    "MR-dRRT": "#d4a017",
+    "MRdRRT": "#d4a017",
+    "ST-CBS": "#2e7d32",
+    "STCBS": "#2e7d32",
+    "PP-ST-RRT": "#d62728",
+    "PrioritizedSTRRT": "#d62728",
+}
+
+FALLBACK_METHOD_COLORS = [
     "#1b9e77",
     "#d95f02",
     "#7570b3",
@@ -362,6 +404,20 @@ METHOD_COLORS = [
     "#a6761d",
     "#666666",
 ]
+
+BACKEND_LINESTYLES = {
+    "vamp": "-",
+    "sphere": "--",
+    "fcl": ":",
+}
+
+BACKEND_ORDER = ("vamp", "sphere", "fcl")
+
+BACKEND_LABELS = {
+    "vamp": "VAMP",
+    "sphere": "Sphere",
+    "fcl": "FCL",
+}
 
 
 def format_float(value: float) -> str:
@@ -868,6 +924,7 @@ def build_result_row(
         "task_index": "" if spec.task_index is None else spec.task_index,
         "seed": spec.seed,
         "method": spec.variant.label,
+        "collision_backend": spec.collision_backend,
         "time_limit_seconds": format_float(spec.time_limit),
         "success": bool(metrics.get("success")) and returncode == 0 and not timed_out,
         "first_solution_time_seconds": csv_scalar(
@@ -889,6 +946,7 @@ def build_event_rows(spec: TrialSpec, metrics: dict[str, Any]) -> list[dict[str,
                 "task_index": "" if spec.task_index is None else spec.task_index,
                 "seed": spec.seed,
                 "method": spec.variant.label,
+                "collision_backend": spec.collision_backend,
                 "elapsed_seconds": event["elapsed_seconds"],
                 "makespan_timesteps": event["makespan_timesteps"],
             }
@@ -1158,6 +1216,7 @@ def result_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
         str(row.get("task_index", "")),
         int(row.get("seed", 0)),
         str(row.get("method", "")),
+        str(row.get("collision_backend", "")),
     )
 
 
@@ -1344,8 +1403,99 @@ def group_rows_by_case(rows: Sequence[dict[str, Any]]) -> dict[str, list[dict[st
     return grouped
 
 
+def display_method_label(value: Any) -> str:
+    text = str(value).strip()
+    return {
+        "CompositeRRT": "Composite RRT-C",
+        "PrioritizedSTRRT": "PP-ST-RRT",
+        "MRdRRT": "MR-dRRT",
+        "STCBS": "ST-CBS",
+    }.get(text, text)
+
+
+def row_method(row: dict[str, Any]) -> str:
+    return display_method_label(row.get("method", ""))
+
+
 def method_color(methods: Sequence[str]) -> dict[str, str]:
-    return {method: METHOD_COLORS[i % len(METHOD_COLORS)] for i, method in enumerate(methods)}
+    colors: dict[str, str] = {}
+    fallback_index = 0
+    for method in methods:
+        color = METHOD_COLOR_BY_LABEL.get(method)
+        if color is None:
+            color = FALLBACK_METHOD_COLORS[
+                fallback_index % len(FALLBACK_METHOD_COLORS)
+            ]
+            fallback_index += 1
+        colors[method] = color
+    return colors
+
+
+def row_backend(row: dict[str, Any]) -> str:
+    value = str(row.get("collision_backend", "")).strip()
+    return value or "vamp"
+
+
+def ordered_backends(rows: Sequence[dict[str, Any]]) -> list[str]:
+    backends = unique_in_order(row_backend(row) for row in rows)
+    order = {backend: index for index, backend in enumerate(BACKEND_ORDER)}
+    return sorted(
+        backends,
+        key=lambda backend: (
+            order.get(backend.lower(), len(order)),
+            backends.index(backend),
+        ),
+    )
+
+
+def backend_label(backend: str) -> str:
+    return BACKEND_LABELS.get(backend.lower(), backend)
+
+
+def backend_linestyle(backend: str) -> str:
+    return BACKEND_LINESTYLES.get(backend.lower(), ":")
+
+
+def add_success_legends(
+    ax: Any,
+    *,
+    methods: Sequence[str],
+    colors: dict[str, str],
+    backends: Sequence[str],
+    plot_backends: bool,
+) -> None:
+    if not plot_backends:
+        ax.legend(loc="lower right")
+        return
+
+    from matplotlib.lines import Line2D
+
+    algorithm_handles = [
+        Line2D([0], [0], color=colors[method], linestyle="-", linewidth=2.4, label=method)
+        for method in methods
+    ]
+    backend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="#333333",
+            linestyle=backend_linestyle(backend),
+            linewidth=2.4,
+            label=backend_label(backend),
+        )
+        for backend in backends
+    ]
+    algorithm_legend = ax.legend(
+        handles=algorithm_handles,
+        title="Algorithms",
+        loc="lower right",
+    )
+    ax.add_artist(algorithm_legend)
+    ax.legend(
+        handles=backend_handles,
+        title="Validation",
+        loc="lower left",
+    )
 
 
 def first_solve_time(row: dict[str, Any]) -> float | None:
@@ -1354,7 +1504,61 @@ def first_solve_time(row: dict[str, Any]) -> float | None:
     return float_or_none(row.get("first_solution_time_seconds"))
 
 
-def write_success_plots(rows: Sequence[dict[str, Any]], output_root: Path) -> list[Path]:
+def log_runtime_lower_bound(
+    rows: Sequence[dict[str, Any]],
+    event_rows: Sequence[dict[str, Any]],
+    x_max: float,
+) -> float:
+    positives: list[float] = []
+    for row in rows:
+        solve_time = first_solve_time(row)
+        if solve_time is not None and solve_time > 0.0:
+            positives.append(solve_time)
+    for event in event_rows:
+        elapsed = float_or_none(event.get("elapsed_seconds"))
+        if elapsed is not None and elapsed > 0.0:
+            positives.append(elapsed)
+
+    if positives:
+        lower = max(min(positives) / 10.0, 1e-6)
+    else:
+        lower = max(x_max / 1000.0, 1e-6)
+    if lower >= x_max:
+        lower = max(x_max / 1000.0, 1e-6)
+    if lower >= x_max:
+        lower = max(x_max * 0.1, 1e-6)
+    return lower
+
+
+def log_runtime_value(value: float, x_min: float) -> float:
+    return value if value > x_min else x_min
+
+
+def time_limit_seconds(row: dict[str, Any]) -> float:
+    value = float_or_none(row.get("time_limit_seconds"))
+    if value is None or value <= 0.0:
+        raise RuntimeError("Plot rows must contain a positive time_limit_seconds value")
+    return value
+
+
+def log_runtime_lower_bounds_by_x_max(
+    rows: Sequence[dict[str, Any]],
+) -> dict[float, float]:
+    rows_by_x_max: dict[float, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_x_max.setdefault(time_limit_seconds(row), []).append(row)
+    return {
+        x_max: log_runtime_lower_bound(x_max_rows, (), x_max)
+        for x_max, x_max_rows in rows_by_x_max.items()
+    }
+
+
+def write_success_plots(
+    rows: Sequence[dict[str, Any]],
+    output_root: Path,
+    *,
+    plot_backends: bool = False,
+) -> list[Path]:
     plt = import_pyplot(output_root)
     if plt is None:
         return []
@@ -1362,48 +1566,69 @@ def write_success_plots(rows: Sequence[dict[str, Any]], output_root: Path) -> li
     plot_dir = output_root / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    x_min_by_x_max = log_runtime_lower_bounds_by_x_max(rows)
     for case_key, case_rows in group_rows_by_case(rows).items():
-        methods = unique_in_order(str(row["method"]) for row in case_rows)
+        methods = unique_in_order(row_method(row) for row in case_rows)
+        backends = ordered_backends(case_rows)
         colors = method_color(methods)
         fig, ax = plt.subplots(figsize=(8.0, 5.0), dpi=160)
-        x_max = max(float(row["time_limit_seconds"]) for row in case_rows)
+        x_max = max(time_limit_seconds(row) for row in case_rows)
+        x_min = x_min_by_x_max[x_max]
         for method in methods:
-            method_rows = [row for row in case_rows if row["method"] == method]
-            solve_times = sorted(
-                value
-                for value in (first_solve_time(row) for row in method_rows)
-                if value is not None
-            )
-            n_trials = len(method_rows)
-            x_values = [0.0]
-            y_values = [0.0]
-            solved = 0
-            for solve_time in solve_times:
-                if solve_time > x_max:
+            method_backends = backends if plot_backends else [""]
+            for backend in method_backends:
+                method_rows = [
+                    row
+                    for row in case_rows
+                    if row_method(row) == method
+                    and (not plot_backends or row_backend(row) == backend)
+                ]
+                if not method_rows:
                     continue
-                x_values.extend([solve_time, solve_time])
-                y_values.extend(
-                    [100.0 * solved / n_trials, 100.0 * (solved + 1) / n_trials]
+                solve_times = sorted(
+                    value
+                    for value in (first_solve_time(row) for row in method_rows)
+                    if value is not None
                 )
-                solved += 1
-            x_values.append(x_max)
-            y_values.append(100.0 * solved / n_trials)
-            ax.step(
-                x_values,
-                y_values,
-                where="post",
-                linewidth=2.4,
-                color=colors[method],
-                label=method,
-            )
+                n_trials = len(method_rows)
+                x_values = [x_min]
+                y_values = [0.0]
+                solved = 0
+                for solve_time in solve_times:
+                    if solve_time > x_max:
+                        continue
+                    solve_time = log_runtime_value(solve_time, x_min)
+                    x_values.extend([solve_time, solve_time])
+                    y_values.extend(
+                        [100.0 * solved / n_trials, 100.0 * (solved + 1) / n_trials]
+                    )
+                    solved += 1
+                x_values.append(x_max)
+                y_values.append(100.0 * solved / n_trials)
+                ax.step(
+                    x_values,
+                    y_values,
+                    where="post",
+                    linewidth=2.4,
+                    color=colors[method],
+                    linestyle=backend_linestyle(backend) if plot_backends else "-",
+                    label=method if not plot_backends else "_nolegend_",
+                )
         title = str(case_rows[0].get("case_title", case_key))
         ax.set_title(title)
         ax.set_xlabel("Runtime (s)")
         ax.set_ylabel("Successful solves (%)")
-        ax.set_xlim(0.0, x_max)
+        ax.set_xscale("log")
+        ax.set_xlim(x_min, x_max)
         ax.set_ylim(0.0, 100.0)
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="lower right")
+        add_success_legends(
+            ax,
+            methods=methods,
+            colors=colors,
+            backends=backends,
+            plot_backends=plot_backends,
+        )
         fig.tight_layout()
         png = plot_dir / f"{case_key}_success.png"
         svg = plot_dir / f"{case_key}_success.svg"
@@ -1431,6 +1656,8 @@ def write_anytime_panel_plots(
     rows: Sequence[dict[str, Any]],
     event_rows: Sequence[dict[str, Any]],
     output_root: Path,
+    *,
+    plot_backends: bool = False,
 ) -> list[Path]:
     plt = import_pyplot(output_root)
     if plt is None:
@@ -1446,98 +1673,124 @@ def write_anytime_panel_plots(
             str(event.get("task_index", "")),
             str(event["method"]),
             str(event["seed"]),
+            row_backend(event),
         )
         events_by_key.setdefault(key, []).append(event)
     for events in events_by_key.values():
         events.sort(key=lambda event: float(event["elapsed_seconds"]))
 
+    x_min_by_x_max = log_runtime_lower_bounds_by_x_max(rows)
     for case_key, case_rows in group_rows_by_case(rows).items():
-        methods = unique_in_order(str(row["method"]) for row in case_rows)
+        methods = unique_in_order(row_method(row) for row in case_rows)
+        backends = ordered_backends(case_rows)
         colors = method_color(methods)
-        x_max = max(float(row["time_limit_seconds"]) for row in case_rows)
+        x_max = max(time_limit_seconds(row) for row in case_rows)
+        x_min = x_min_by_x_max[x_max]
         title = str(case_rows[0].get("case_title", case_key))
         fig, (ax_success, ax_makespan) = plt.subplots(
             2, 1, figsize=(8.0, 7.0), dpi=160, sharex=True
         )
 
         for method in methods:
-            method_rows = [row for row in case_rows if row["method"] == method]
-            solve_times = sorted(
-                value
-                for value in (first_solve_time(row) for row in method_rows)
-                if value is not None
-            )
-            n_trials = len(method_rows)
-            x_success = [0.0]
-            y_success = [0.0]
-            solved = 0
-            for solve_time in solve_times:
-                if solve_time > x_max:
-                    continue
-                x_success.extend([solve_time, solve_time])
-                y_success.extend(
-                    [100.0 * solved / n_trials, 100.0 * (solved + 1) / n_trials]
-                )
-                solved += 1
-            x_success.append(x_max)
-            y_success.append(100.0 * solved / n_trials)
-            ax_success.step(
-                x_success,
-                y_success,
-                where="post",
-                linewidth=2.2,
-                color=colors[method],
-                label=method,
-            )
-
-            grid = {0.0, x_max}
-            per_seed_events: list[list[dict[str, Any]]] = []
-            for row in method_rows:
-                key = (
-                    str(row["case"]),
-                    str(row.get("task_index", "")),
-                    str(row["method"]),
-                    str(row["seed"]),
-                )
-                seed_events = events_by_key.get(key, [])
-                per_seed_events.append(seed_events)
-                for event in seed_events:
-                    elapsed = float_or_none(event.get("elapsed_seconds"))
-                    if elapsed is not None and 0.0 <= elapsed <= x_max:
-                        grid.add(elapsed)
-            x_grid = sorted(grid)
-            median_x: list[float] = []
-            median_y: list[float] = []
-            for t in x_grid:
-                values = [
-                    value
-                    for value in (
-                        latest_makespan_at(seed_events, t)
-                        for seed_events in per_seed_events
-                    )
-                    if value is not None
+            method_backends = backends if plot_backends else [""]
+            for backend in method_backends:
+                method_rows = [
+                    row
+                    for row in case_rows
+                    if row_method(row) == method
+                    and (not plot_backends or row_backend(row) == backend)
                 ]
-                if values:
-                    median_x.append(t)
-                    median_y.append(statistics.median(values))
-            if median_x:
-                ax_makespan.step(
-                    median_x,
-                    median_y,
+                if not method_rows:
+                    continue
+                solve_times = sorted(
+                    value
+                    for value in (first_solve_time(row) for row in method_rows)
+                    if value is not None
+                )
+                n_trials = len(method_rows)
+                x_success = [x_min]
+                y_success = [0.0]
+                solved = 0
+                for solve_time in solve_times:
+                    if solve_time > x_max:
+                        continue
+                    solve_time = log_runtime_value(solve_time, x_min)
+                    x_success.extend([solve_time, solve_time])
+                    y_success.extend(
+                        [100.0 * solved / n_trials, 100.0 * (solved + 1) / n_trials]
+                    )
+                    solved += 1
+                x_success.append(x_max)
+                y_success.append(100.0 * solved / n_trials)
+                linestyle = backend_linestyle(backend) if plot_backends else "-"
+                ax_success.step(
+                    x_success,
+                    y_success,
                     where="post",
                     linewidth=2.2,
                     color=colors[method],
-                    label=method,
+                    linestyle=linestyle,
+                    label=method if not plot_backends else "_nolegend_",
                 )
+
+                grid = {x_min, x_max}
+                per_seed_events: list[list[dict[str, Any]]] = []
+                for row in method_rows:
+                    key = (
+                        str(row["case"]),
+                        str(row.get("task_index", "")),
+                        str(row["method"]),
+                        str(row["seed"]),
+                        row_backend(row),
+                    )
+                    seed_events = events_by_key.get(key, [])
+                    per_seed_events.append(seed_events)
+                    for event in seed_events:
+                        elapsed = float_or_none(event.get("elapsed_seconds"))
+                        if elapsed is not None and 0.0 <= elapsed <= x_max:
+                            grid.add(log_runtime_value(elapsed, x_min))
+                x_grid = sorted(grid)
+                median_x: list[float] = []
+                median_y: list[float] = []
+                for t in x_grid:
+                    values = [
+                        value
+                        for value in (
+                            latest_makespan_at(seed_events, t)
+                            for seed_events in per_seed_events
+                        )
+                        if value is not None
+                    ]
+                    if values:
+                        median_x.append(t)
+                        median_y.append(statistics.median(values))
+                if median_x:
+                    ax_makespan.step(
+                        median_x,
+                        median_y,
+                        where="post",
+                        linewidth=2.2,
+                        color=colors[method],
+                        linestyle=linestyle,
+                        label=method if not plot_backends else "_nolegend_",
+                    )
 
         ax_success.set_title(title)
         ax_success.set_ylabel("Successful solves (%)")
         ax_success.set_ylim(0.0, 100.0)
         ax_success.grid(True, alpha=0.3)
-        ax_success.legend(loc="lower right")
+        add_success_legends(
+            ax_success,
+            methods=methods,
+            colors=colors,
+            backends=backends,
+            plot_backends=plot_backends,
+        )
         ax_makespan.set_xlabel("Runtime (s)")
         ax_makespan.set_ylabel("Median current best makespan")
-        ax_makespan.set_xlim(0.0, x_max)
+        ax_success.set_xscale("log")
+        ax_makespan.set_xscale("log")
+        ax_makespan.set_xlim(x_min, x_max)
         ax_makespan.grid(True, alpha=0.3)
         fig.tight_layout()
         png = plot_dir / f"{case_key}_anytime_panel.png"
@@ -1557,6 +1810,7 @@ def finish_outputs(
     result_rows: Sequence[dict[str, Any]],
     event_rows: Sequence[dict[str, Any]],
     plot_kind: str,
+    plot_backends: bool = False,
 ) -> list[Path]:
     result_csv_path = result_csv_path or output_root / "results.csv"
     event_csv_path = event_csv_path or output_root / "solution_events.csv"
@@ -1565,7 +1819,16 @@ def finish_outputs(
     write_csv(result_csv_path, RESULT_COLUMNS, result_rows)
     write_csv(event_csv_path, EVENT_COLUMNS, event_rows)
     if plot_kind == "success":
-        return write_success_plots(result_rows, output_root)
+        return write_success_plots(
+            result_rows,
+            output_root,
+            plot_backends=plot_backends,
+        )
     if plot_kind == "anytime":
-        return write_anytime_panel_plots(result_rows, event_rows, output_root)
+        return write_anytime_panel_plots(
+            result_rows,
+            event_rows,
+            output_root,
+            plot_backends=plot_backends,
+        )
     return []

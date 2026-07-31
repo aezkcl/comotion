@@ -532,12 +532,14 @@ int rewireFrom(TreeSnapshot &tree, Motion *added, double lambda) {
     return rewired;
 }
 
-USTRRTstar::Result runIterations(TreeSnapshot &tree, double lambda,
-                                    int iterations) {
+USTRRTstar::Result runIterations(
+    TreeSnapshot &tree, double lambda, int iterations,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt) {
     USTRRTstar::Result result;
     if (tree.goal_permanently_blocked || tree.start_motion == nullptr ||
         !tree.start_motion->active || tree.start_motion->marked ||
-        tree.usableMotionCount() == 0 || iterations <= 0) {
+        tree.usableMotionCount() == 0 || iterations == 0) {
         return USTRRTstar::extractBestPath(tree, lambda);
     }
 
@@ -550,9 +552,11 @@ USTRRTstar::Result runIterations(TreeSnapshot &tree, double lambda,
     const double max_step = tree.vmax * tree.params.layer_dt_seconds;
 
     for (int iter = 0;
-         iter < iterations &&
+         (iterations < 0 || iter < iterations) &&
          static_cast<int>(tree.motions.size()) < tree.params.max_samples;
          ++iter) {
+        if (deadline && std::chrono::steady_clock::now() >= *deadline)
+            break;
         if (rng.uniform01() < kGoalSampleProbability) {
             setState(sample, tree.goal_config, tree.current_time_upper_bound);
         } else {
@@ -748,7 +752,9 @@ USTRRTstar::buildTree(int agent_index, const std::vector<double> &start,
                          const CollisionChecker &collision_checker,
                          const Params &params, std::size_t resolution,
                          double vmax, double lambda,
-                         std::uint32_t planning_seed) {
+                         std::uint32_t planning_seed,
+                         std::optional<std::chrono::steady_clock::time_point>
+                             deadline) {
     auto tree = std::make_shared<TreeSnapshot>();
     tree->model = &model;
     tree->collision_checker = &collision_checker;
@@ -784,7 +790,9 @@ USTRRTstar::buildTree(int agent_index, const std::vector<double> &start,
         return {std::move(tree), {}};
     }
 
-    auto result = runIterations(*tree, lambda, params.max_iterations);
+    auto result =
+        runIterations(*tree, lambda, deadline ? -1 : params.max_iterations,
+                      deadline);
     return {std::move(tree), std::move(result)};
 }
 
@@ -865,13 +873,13 @@ USTRRTstar::Result USTRRTstar::extractBestPath(const TreeSnapshot &tree,
     return best;
 }
 
-USTRRTstar::Result USTRRTstar::extendTree(TreeSnapshot &tree,
-                                                double lambda,
-                                                int iterations) {
+USTRRTstar::Result USTRRTstar::extendTree(
+    TreeSnapshot &tree, double lambda, int iterations,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
     const int iters =
         iterations > 0 ? iterations : tree.params.max_iterations;
     tree.rebuildNearestNeighbors();
-    return runIterations(tree, lambda, iters);
+    return runIterations(tree, lambda, deadline ? -1 : iters, deadline);
 }
 
 void USTRRTstar::pruneDescendants(TreeSnapshot &tree, int motion_index) {

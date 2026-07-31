@@ -9,9 +9,11 @@
 #include <ompl/datastructures/NearestNeighbors.h>
 #include <ompl/util/RandomNumbers.h>
 
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace comotion {
@@ -113,12 +115,16 @@ public:
         const std::vector<double> &goal, const RobotModel &model,
         const CollisionChecker &collision_checker, const Params &params,
         std::size_t resolution, double vmax, double lambda,
-        std::uint32_t planning_seed = 42);
+        std::uint32_t planning_seed = 42,
+        std::optional<std::chrono::steady_clock::time_point> deadline =
+            std::nullopt);
 
     static Result extractBestPath(const TreeSnapshot &tree, double lambda);
 
     static Result extendTree(TreeSnapshot &tree, double lambda,
-                             int iterations = -1);
+                             int iterations = -1,
+                             std::optional<std::chrono::steady_clock::time_point>
+                                 deadline = std::nullopt);
 
     static void pruneDescendants(TreeSnapshot &tree, int motion_index);
     static void pruneNeighbors(TreeSnapshot &tree, int motion_index,

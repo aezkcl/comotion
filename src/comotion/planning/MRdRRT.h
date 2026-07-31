@@ -36,6 +36,15 @@ public:
         LazyAStar,
     };
 
+    enum class LocalConnectorMode {
+        /// Section 4.2 of Solovey et al.: shortest paths on the individual
+        /// roadmaps, ordered by the acyclic start/goal interference graph.
+        PaperPrioritized,
+        /// Legacy CoMotion behavior: all robots interpolate directly and
+        /// synchronously from the tree anchor to the target.
+        Synchronized,
+    };
+
     ompl::base::PlannerStatus solve(double timeLimit) override;
     std::vector<Path> getSolutionPaths() const override;
     std::string name() const override { return "MRdRRT"; }
@@ -50,6 +59,12 @@ public:
     CostMetric costMetric() const { return cost_metric_; }
     void setTensorSearchMode(TensorSearchMode mode) { tensor_search_mode_ = mode; }
     TensorSearchMode tensorSearchMode() const { return tensor_search_mode_; }
+    void setLocalConnectorMode(LocalConnectorMode mode) {
+        local_connector_mode_ = mode;
+    }
+    LocalConnectorMode localConnectorMode() const {
+        return local_connector_mode_;
+    }
     void setStopAtFirstSolution(bool value) { stop_at_first_solution_ = value; }
     bool stopAtFirstSolution() const { return stop_at_first_solution_; }
     void setUseStarRewiring(bool value) { use_star_rewiring_ = value; }
@@ -65,6 +80,7 @@ public:
 
     static const char *costMetricName(CostMetric metric);
     static const char *tensorSearchModeName(TensorSearchMode mode);
+    static const char *localConnectorModeName(LocalConnectorMode mode);
 
 private:
     /// Single-robot roadmap from OMPL PRM* getPlannerData: vertex 0 = query start,
@@ -97,6 +113,23 @@ private:
         int parent = -1;
         std::vector<int> children;
         double cost = 0.0;
+    };
+
+    struct LocalConnection {
+        /// Dense global-timestep schedule beginning at the anchor and ending
+        /// at the target. For the paper connector, exactly one robot moves at
+        /// a time; paths contain leading holds and may end early at the goal,
+        /// relying on the standard clamp-to-final-configuration semantics.
+        std::vector<Path> paths;
+        double cost = 0.0;
+        std::vector<int> priority_order;
+    };
+
+    struct TargetConnection {
+        std::vector<Path> paths;
+        double cost = 0.0;
+        bool used_local_connector = false;
+        std::vector<int> priority_order;
     };
 
     void buildRoadmaps(
@@ -141,26 +174,48 @@ private:
     std::vector<Path> pathsFromCompositePath(
         const std::vector<CompositeVertex> &cv_path) const;
 
+    std::vector<Path> appendLocalConnection(
+        const std::vector<Path> &tree_paths,
+        const std::vector<Path> &local_paths) const;
+
     bool isCompositeEdgeValid(const CompositeVertex &from,
                               const CompositeVertex &to) const;
 
-    /// Straight-line motion in joint space per robot from `from` to `goal_configs`;
-    /// discretization matches `isCompositeEdgeValid`; uses full composite collision.
-    bool localConnector(
+    std::optional<std::vector<int>> shortestIndividualRoadmapPath(
+        int robot_index, int start_vertex, int goal_vertex,
+        std::chrono::steady_clock::time_point deadline) const;
+
+    Path denseIndividualRoadmapPath(
+        int robot_index, const std::vector<int> &vertex_path) const;
+
+    /// Paper Section 4.2 connector. It finds an individual roadmap path for
+    /// every robot, derives ordering constraints using backend pair-path
+    /// checks against each other robot's anchor and target configurations,
+    /// and returns a sequential schedule iff that graph is acyclic.
+    std::optional<LocalConnection> paperPrioritizedLocalConnector(
+        const CompositeVertex &from, const CompositeVertex &goal,
+        std::chrono::steady_clock::time_point deadline) const;
+
+    /// Legacy direct synchronized interpolation, retained as an explicit mode.
+    std::optional<LocalConnection> synchronizedLocalConnector(
         const CompositeVertex &from,
         const std::vector<std::vector<double>> &goal_configs,
         std::chrono::steady_clock::time_point deadline) const;
 
+    std::optional<LocalConnection> localConnector(
+        const CompositeVertex &from, const CompositeVertex &goal,
+        const std::vector<std::vector<double>> &goal_configs,
+        std::chrono::steady_clock::time_point deadline) const;
+
     /// k = max(1, floor(log2(max(1, total_iteration)))), capped by tree size;
-    /// try local composite bridge from k nearest tree nodes to goal. Returns
-    /// start → … → anchor → goal_v (goal appended) or nullopt.
-    std::optional<std::vector<CompositeVertex>> connectToTarget(
+    /// try the configured local connector from k nearest tree nodes to goal.
+    /// The returned paths contain the exact schedule accepted by the connector.
+    std::optional<TargetConnection> connectToTarget(
         const CompositeVertex &goal_v,
         const std::unordered_map<CompositeVertex, int, CompositeVertexHash>
             &vertex_to_node,
         uint64_t total_iteration,
-        std::chrono::steady_clock::time_point deadline,
-        double *path_cost = nullptr) const;
+        std::chrono::steady_clock::time_point deadline) const;
 
     std::vector<CompositeVertex> traceTreePathToRoot(
         int node_index) const;
@@ -190,6 +245,8 @@ private:
     int iterations_per_batch_ = 1;
     CostMetric cost_metric_ = CostMetric::SumOfCosts;
     TensorSearchMode tensor_search_mode_ = TensorSearchMode::Drrt;
+    LocalConnectorMode local_connector_mode_ =
+        LocalConnectorMode::PaperPrioritized;
     bool stop_at_first_solution_ = true;
     bool use_star_rewiring_ = false;
     bool exclude_roadmap_build_time_from_budget_ = false;
@@ -204,6 +261,11 @@ private:
     /// Composite anchors that already failed `localConnector` to the current goal this solve;
     /// skipped in later connectToTarget calls to avoid repeating the same collision checks.
     mutable std::unordered_set<CompositeVertex, CompositeVertexHash> local_connect_failed_;
+
+    mutable std::uint64_t local_connector_attempts_{0};
+    mutable std::uint64_t local_connector_successes_{0};
+    bool solution_used_local_connector_{false};
+    std::vector<int> solution_local_connector_priority_order_;
 
     /// Phase-2 tensor RRT composite configuration sampling (isolated from PRM* draw count).
     mutable ompl::RNG tensor_phase_rng_;

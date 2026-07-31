@@ -506,6 +506,108 @@ PackedRobotSpheres buildPackedRobotSpheresForPack(const RobotModel &robot,
     return {};
 }
 
+bool packedRobotPackValidExhaustive(
+    const RobotModel &robot, const Path &path, const BatchPack &pack,
+    const std::vector<ObstacleSphere> &obstacles,
+    const std::vector<ObstacleCylinder> &cylinders) {
+    if (path.empty() || pack.lanes == 0)
+        return true;
+
+    const auto packed = buildPackedRobotSpheresForPack(robot, path, pack);
+    const auto representative =
+        robot.getCollisionSpheres(configAt(path, pack.timesteps[0]));
+    if (representative.size() != packed.spheres.size()) {
+        throw std::runtime_error(
+            "VAMP backend: exhaustive sphere metadata size mismatch.");
+    }
+
+    bool valid = true;
+    for (std::size_t sphere_index = 0;
+         sphere_index < packed.spheres.size(); ++sphere_index) {
+        const auto &sphere = packed.spheres[sphere_index];
+        std::array<float, kRake> xs{};
+        std::array<float, kRake> ys{};
+        std::array<float, kRake> zs{};
+        std::array<float, kRake> rs{};
+        sphere.x.to_array_unaligned(xs.data());
+        sphere.y.to_array_unaligned(ys.data());
+        sphere.z.to_array_unaligned(zs.data());
+        sphere.r.to_array_unaligned(rs.data());
+
+        for (const auto &obstacle : obstacles) {
+            const Eigen::Vector3f obstacle_center =
+                obstacle.center.cast<float>();
+            const float obstacle_radius =
+                static_cast<float>(obstacle.radius);
+            for (std::size_t lane = 0; lane < pack.lanes; ++lane) {
+                const float dx = xs[lane] - obstacle_center.x();
+                const float dy = ys[lane] - obstacle_center.y();
+                const float dz = zs[lane] - obstacle_center.z();
+                const float radius = rs[lane] + obstacle_radius;
+                if (dx * dx + dy * dy + dz * dz < radius * radius)
+                    valid = false;
+            }
+        }
+
+        for (const auto &cylinder : cylinders) {
+            const Eigen::Vector3f cylinder_center =
+                cylinder.center.cast<float>();
+            const Eigen::Vector3f cylinder_axis =
+                cylinder.axis.cast<float>();
+            const float cylinder_half_height =
+                static_cast<float>(cylinder.half_height);
+            const float cylinder_radius =
+                static_cast<float>(cylinder.radius);
+            for (std::size_t lane = 0; lane < pack.lanes; ++lane) {
+                const Eigen::Vector3f center(xs[lane], ys[lane], zs[lane]);
+                const Eigen::Vector3f offset = center - cylinder_center;
+                const float axial = offset.dot(cylinder_axis);
+                const float radial =
+                    (offset - axial * cylinder_axis).norm();
+                const float axial_excess =
+                    std::max(0.0F,
+                             std::abs(axial) - cylinder_half_height);
+                const float radial_excess =
+                    std::max(0.0F, radial - cylinder_radius);
+                const float radius = rs[lane];
+                if (axial_excess * axial_excess +
+                        radial_excess * radial_excess <
+                    radius * radius) {
+                    valid = false;
+                }
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < packed.spheres.size(); ++i) {
+        for (std::size_t j = i + 1; j < packed.spheres.size(); ++j) {
+            if (representative[i].link_index ==
+                representative[j].link_index) {
+                continue;
+            }
+            const auto &link_i =
+                robot.links()[representative[i].link_index];
+            const auto &link_j =
+                robot.links()[representative[j].link_index];
+            if (robot.isSelfCollisionDisabled(link_i.name, link_j.name))
+                continue;
+
+            const auto distances = vamp::collision::sphere_sphere_sql2(
+                packed.spheres[i].x, packed.spheres[i].y,
+                packed.spheres[i].z, packed.spheres[i].r,
+                packed.spheres[j].x, packed.spheres[j].y,
+                packed.spheres[j].z, packed.spheres[j].r);
+            std::array<bool, kRake> lane_collision{};
+            markCollidingLanes(distances, pack.lanes, lane_collision);
+            for (std::size_t lane = 0; lane < pack.lanes; ++lane) {
+                if (lane_collision[lane])
+                    valid = false;
+            }
+        }
+    }
+    return valid;
+}
+
 std::optional<std::size_t> earliestPackedSphereConflictTimestep(
     const PackedRobotSpheres &spheres_a, const PackedRobotSpheres &spheres_b,
     const BatchPack &pack, std::size_t scan_begin = 0) {
@@ -756,6 +858,10 @@ public:
 
     VampValidationStrategy vampValidationStrategy() const override {
         return strategy_;
+    }
+
+    ValidationWorkStats lastValidationWorkStats() const override {
+        return last_work_stats_;
     }
 
     void onEnvironmentChanged(
@@ -1481,6 +1587,7 @@ public:
         const std::vector<ObstacleCylinder> &cylinders) const override {
         (void)obstacles;
         (void)cylinders;
+        last_work_stats_ = {};
         if (paths.size() != robots.size())
             return false;
 
@@ -1502,8 +1609,36 @@ public:
         }
         if (scan_begin >= end)
             return true;
+        last_work_stats_.motion_timesteps_possible = end - scan_begin;
+        if (options.check_environment) {
+            for (const std::size_t begin : effective_starts) {
+                if (begin < end) {
+                    last_work_stats_.robot_state_checks_possible += end - begin;
+                }
+            }
+        }
+        for (const std::size_t begin : effective_pair_starts) {
+            if (begin < end)
+                last_work_stats_.robot_pair_checks_possible += end - begin;
+        }
+        std::vector<bool> timestep_checked(end - scan_begin, false);
+        const auto mark_pack = [&](const BatchPack &pack) {
+            ++last_work_stats_.simd_packs_checked;
+            last_work_stats_.simd_lanes_checked += pack.lanes;
+            for (std::size_t lane = 0; lane < pack.lanes; ++lane) {
+                const std::size_t timestep = pack.timesteps[lane];
+                if (timestep < scan_begin || timestep >= end)
+                    continue;
+                const std::size_t index = timestep - scan_begin;
+                if (!timestep_checked[index]) {
+                    timestep_checked[index] = true;
+                    ++last_work_stats_.motion_timesteps_checked;
+                }
+            }
+        };
         const auto packs =
             makeBatchPacks(scan_begin, end, strategy_.packing);
+        bool valid = true;
 
         if (strategy_.ordering == VampBatchOrdering::Hierarchical) {
             if (options.check_environment) {
@@ -1513,9 +1648,20 @@ public:
                             filterPackAtOrAfter(pack, effective_starts[i]);
                         if (robot_pack.lanes == 0)
                             continue;
-                        if (!isRobotPackValid(*robots[i], paths[i],
-                                              robot_pack)) {
-                            return false;
+                        mark_pack(robot_pack);
+                        last_work_stats_.robot_state_checks_completed +=
+                            robot_pack.lanes;
+                        const bool robot_valid =
+                            options.exhaustive
+                                ? packedRobotPackValidExhaustive(
+                                      *robots[i], paths[i], robot_pack,
+                                      world_spheres_, world_cylinders_)
+                                : isRobotPackValid(*robots[i], paths[i],
+                                                   robot_pack);
+                        if (!robot_valid) {
+                            if (!options.exhaustive)
+                                return false;
+                            valid = false;
                         }
                     }
                 }
@@ -1529,14 +1675,19 @@ public:
                                       i, j, paths.size())]);
                         if (pair_pack.lanes == 0)
                             continue;
+                        mark_pack(pair_pack);
+                        last_work_stats_.robot_pair_checks_completed +=
+                            pair_pack.lanes;
                         if (!isPairPackValid(*robots[i], paths[i], *robots[j],
                                              paths[j], pair_pack)) {
-                            return false;
+                            if (!options.exhaustive)
+                                return false;
+                            valid = false;
                         }
                     }
                 }
             }
-            return true;
+            return valid;
         }
 
         for (const auto &pack : packs) {
@@ -1546,8 +1697,20 @@ public:
                         filterPackAtOrAfter(pack, effective_starts[i]);
                     if (robot_pack.lanes == 0)
                         continue;
-                    if (!isRobotPackValid(*robots[i], paths[i], robot_pack)) {
-                        return false;
+                    mark_pack(robot_pack);
+                    last_work_stats_.robot_state_checks_completed +=
+                        robot_pack.lanes;
+                    const bool robot_valid =
+                        options.exhaustive
+                            ? packedRobotPackValidExhaustive(
+                                  *robots[i], paths[i], robot_pack,
+                                  world_spheres_, world_cylinders_)
+                            : isRobotPackValid(*robots[i], paths[i],
+                                               robot_pack);
+                    if (!robot_valid) {
+                        if (!options.exhaustive)
+                            return false;
+                        valid = false;
                     }
                 }
             }
@@ -1559,15 +1722,20 @@ public:
                                   i, j, paths.size())]);
                     if (pair_pack.lanes == 0)
                         continue;
+                    mark_pack(pair_pack);
+                    last_work_stats_.robot_pair_checks_completed +=
+                        pair_pack.lanes;
                     if (!isPairPackValid(*robots[i], paths[i], *robots[j],
                                          paths[j], pair_pack)) {
-                        return false;
+                        if (!options.exhaustive)
+                            return false;
+                        valid = false;
                     }
                 }
             }
         }
 
-        return true;
+        return valid;
     }
 
     std::optional<CompositeConflict> findFirstCompositePathConflict(
@@ -2361,11 +2529,9 @@ private:
                                 "Process-parallel VAMP conflict finder result "
                                 "read failed");
                         }
-                        if (options.temporary_conflict_find_instrumentation) {
-                            // TEMP(ablation): remove this accumulation once
-                            // the conflict-detection timing table is no longer
-                            // needed for reproduction work.
-                            options.temporary_conflict_find_instrumentation
+                        if (options.conflict_find_timing_instrumentation) {
+                            // Accumulate per-worker timings for planner metrics.
+                            options.conflict_find_timing_instrumentation
                                 ->recordWorkerResult(
                                     worker_index,
                                     result.build_worker_wall_seconds,
@@ -2826,6 +2992,7 @@ private:
     VampValidationStrategy strategy_{};
     mutable std::unordered_map<const RobotModel *, SphereEnvironmentCache>
         sphere_env_cache_;
+    mutable ValidationWorkStats last_work_stats_;
 };
 
 #else

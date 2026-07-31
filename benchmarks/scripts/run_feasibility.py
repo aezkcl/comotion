@@ -109,6 +109,14 @@ def parse_args() -> argparse.Namespace:
         default=30.0,
         help="Seconds added to --time-limit for the process timeout.",
     )
+    parser.add_argument(
+        "--plot-backends",
+        action="store_true",
+        help=(
+            "Draw separate curves for each collision backend using common "
+            "algorithm colors and backend line styles."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -177,6 +185,7 @@ def main() -> int:
         result_rows=rows,
         event_rows=event_rows,
         plot_kind="success",
+        plot_backends=args.plot_backends,
     )
     print(f"results_csv: {result_csv_path}")
     print(f"solution_events_csv: {event_csv_path}")

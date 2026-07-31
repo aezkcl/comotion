@@ -27,7 +27,20 @@ cmake --build build --target mobile_robot_2d_crossing
 cmake --build build --target planar_manipulator_cross
 cmake --build build --target panda_cage
 cmake --build build --target panda_flat
+cmake --build build --target heterogeneous_corridor
 ```
+
+### MR-dRRT local connector
+
+MR-dRRT defaults to the paper's prioritized local connector. For each
+ConnectToTarget candidate it finds one path per robot on the individual PRM
+roadmaps, builds the start/goal interference graph described in Section 4.2 of
+Solovey et al., and executes the paths in topological priority order. Emitted
+paths include the resulting waits and sequential motion.
+
+Use `--drrt-local-connector synchronized` to select the legacy direct
+synchronized anchor-to-goal interpolation. The accepted values are
+`prioritized` (default) and `synchronized`.
 
 ## Public Runners
 
@@ -59,6 +72,10 @@ python3 benchmarks/scripts/run_feasibility.py \
 ```
 
 This writes cumulative success plots under `<output-root>/plots/`.
+Add `--plot-backends` when one output contains multiple validation backends.
+In that mode, algorithm color is held fixed while validation backend is encoded
+by line style: VAMP solid, sphere dashed, and FCL dotted. Runtime axes use a
+log scale, with one shared lower bound for all plots that have the same timeout.
 
 ### Anytime
 
@@ -152,6 +169,120 @@ The historical `parallel_arc_optimistic_ablation_20260720_163149` bundle
 covers tasks 1–4 only and should be treated as a partial diagnostic, not as the
 Table III source.
 
+### Planner/Backend Replication
+
+```bash
+python3 benchmarks/scripts/run_planner_trials.py \
+  --scenarios default \
+  --methods default \
+  --backends default \
+  --cores 8
+```
+
+This runner expands to the paper-scale planner trials for the supported
+scenario families: `panda_cage`, `flying_spheres`, and
+`heterogeneous_corridor`. The `flying_spheres` scenario maps to the
+`mobile_robot_2d_crossing --scenario parallel` app, `panda_cage` uses the
+built-in Panda cage tasks directly, and `heterogeneous_corridor` runs the
+mixed corridor cases with twice as many spheres as Pandas.
+
+Defaults use the paper's main cumulative-success trial counts and limits:
+flying spheres use 30 seeds with a 10 second limit for each robot count; Panda
+cage uses five built-in tasks and ten seeds per task, with a 150 second limit;
+heterogeneous corridor uses task 0 with 10 seeds and a 150 second limit. Use
+`--num-trials`, `--time-limit`, or `--time-limits
+flying_spheres=10,panda_cage=150,heterogeneous_corridor=150` to override
+those defaults. Default team sizes are flying spheres n=4,8,16,32,64,128,
+Panda cage n=4,8,16, and heterogeneous corridor p4/s8,p8/s16,p16/s32. The
+runner deliberately uses the same 50 Panda trials (five tasks by ten seeds) at
+all three Panda team sizes. These uniform defaults expand the paper's narrower
+method-specific extension runs; staged pruning prevents configurations that
+already failed at a smaller size from consuming time at larger sizes.
+
+Non-dry runs are staged by scenario and increasing team size. If a
+method/backend combination solves zero trials for one task index at a team
+size, the runner records that in `pruned_combinations.json` and skips the same
+combination and task index at larger team sizes in that scenario. Panda cage
+task JSON is generated separately for each team size, so its task index is used
+as a cross-size pruning key rather than a literal same-instance guarantee. The
+heterogeneous cases use the canonical `mr-ompl` p4/s8, p8/s16, and p16/s32 task
+files under `resources/benchmarks`; the manifest records each selected file and
+SHA-256 digest. Those files define the exact ordered robots, Panda bases and
+orientations, starts/goals, sphere radii, environment, and obstacles. Pruning
+remains backend-specific, so failure with one collision backend does not
+suppress the others.
+
+The default planner parameter file is
+`benchmarks/configs/planner_trial_params.json`. For flying spheres and Panda
+cage, it intentionally extrapolates each scenario's effective n=8 profile to
+every requested team size. The representative heterogeneous p4/s8 profile is
+likewise shared by p4/s8, p8/s16, and p16/s32. These are representative tuning
+profiles, not independent per-size sweeps. Planner-specific overrides can be
+placed under `planners` at the global, scenario, or robot-count level; the
+legacy key `methods` is still accepted for the same purpose. Shared defaults
+are resolved first, then planner-specific overrides.
+
+The heterogeneous PP-ST-RRT profile uses initial batch size 4096, initial time
+factor 2, time-factor increase 2, first-solution return, and rewiring off.
+Priorities are seed-shuffled, with Pandas shuffled first and flying spheres
+shuffled separately after them.
+
+VAMP planning strategy is selected by the planner parameter file. The paper
+default uses combined validation ordering with rake packing for every planner.
+The validation-timing app still selects each named VAMP variant explicitly when
+comparing validation strategies.
+
+Use a dry run to inspect every planned case and a sample of commands without
+creating an output directory:
+
+```bash
+python3 benchmarks/scripts/run_planner_trials.py --dry-run
+```
+
+Add `--dry-run-limit 0` to print every command.
+
+The default dry run reports 5,400 trials before pruning, split across all 12
+paper-reported team sizes in this uniform suite.
+
+The runner is resumable. Each trial writes a stable `trials/.../trial.json`
+record plus the raw metrics JSON. Re-running with the same `--output-root`
+skips completed trials by default only when the record's configuration
+signature matches the current command and parameters. If you change planner
+parameters, build paths, time limits, or other trial inputs, pass
+`--existing overwrite` or choose a new `--output-root`.
+
+Use `plot_results.py` to generate plots from an existing `results.csv`, such as
+the full planner/backend replication output:
+
+```bash
+python3 benchmarks/scripts/plot_results.py \
+  benchmarks/results/mrm_in_ms_full_suite_tuned_20260709_185756/results.csv \
+  --plot-kind success \
+  --plot-backends
+```
+
+With `--plot-backends`, each scenario/team-size plot uses one color per
+algorithm and one line style per validation backend. The legend is split into
+`Algorithms` for the colored solid lines and `Validation` for backend line
+styles. Runtime axes use a log scale, with one shared lower bound for all plots
+that have the same timeout.
+
+### Parameter Sweeps
+
+```bash
+python3 benchmarks/scripts/run_param_sweep.py \
+  --config benchmarks/configs/heterogenous_param_sweep.json \
+  --apps heterogenous_p4_s8 \
+  --cores 8 \
+  --best-params-output benchmarks/configs/heterogenous_params.json
+```
+
+The sweep runner is app-generic: the JSON config supplies each app executable,
+base arguments, timeout, methods, trials per parameter set, and method-specific
+parameter sets or Cartesian grids. Ranking uses higher `success_count` first,
+then lower mean effective `planning_time_seconds`; makespan is not used for
+selecting best parameters.
+
 ## Case Catalog
 
 The runners expose these benchmark cases:
@@ -178,13 +309,18 @@ panda_cage_n4
 panda_cage_n8
 panda_cage_n16
 panda_flat_n4
+heterogeneous_corridor_p4_s8
+heterogeneous_corridor_p8_s16
+heterogeneous_corridor_p16_s32
 ```
 
 `--cases default` expands to a small smoke/evaluation set. Named paper groups
 are also accepted: `paper`, `paper_2d`, `paper_mobile_cross`,
 `paper_mobile_circle`, `paper_planar_cross`, `paper_panda`, and
 `paper_conflict_ablation`. Panda cases are task-based and use `--task-indices`
-to select built-in tasks.
+to select built-in tasks. The heterogeneous corridor cases place Pandas first
+in the robot order, followed by flying spheres, matching the priority order
+used by the paper-style scenario.
 
 ## Output Contract
 
@@ -213,13 +349,13 @@ if `--output-root` is omitted, metrics, manifest, plots, and the default
 `results.csv` columns:
 
 ```text
-case,case_title,task_index,seed,method,time_limit_seconds,success,first_solution_time_seconds,planning_time_seconds,makespan_timesteps,sum_of_cost_timesteps,metrics_json
+case,case_title,task_index,seed,method,collision_backend,time_limit_seconds,success,first_solution_time_seconds,planning_time_seconds,makespan_timesteps,sum_of_cost_timesteps,metrics_json
 ```
 
 `solution_events.csv` columns:
 
 ```text
-case,task_index,seed,method,elapsed_seconds,makespan_timesteps
+case,task_index,seed,method,collision_backend,elapsed_seconds,makespan_timesteps
 ```
 
 Direct `--metrics-json` output from each workload executable uses the compact
@@ -277,6 +413,16 @@ The workload executables can also be called directly. For example:
   --time-limit 60 \
   --seed 0 \
   --metrics-json /tmp/panda_cage_n2_arc_seed0.json
+
+./build/apps/heterogeneous_corridor \
+  --num-pandas 4 \
+  --num-spheres 8 \
+  --task-index 0 \
+  --algorithm arc \
+  --collision-backend vamp \
+  --time-limit 60 \
+  --seed 0 \
+  --metrics-json /tmp/heterogeneous_corridor_p4_s8_arc_seed0.json
 ```
 
 Installed direct Panda or Planar3 executable runs resolve the packaged

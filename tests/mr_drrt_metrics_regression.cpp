@@ -1,4 +1,5 @@
 #include "comotion/planning/MRdRRT.h"
+#include "comotion/collision/detail/ValidationUtils.h"
 #include "comotion/planning/MultiRobotProblem.h"
 #include "comotion/planning/PlanningRng.h"
 #include "comotion/robot/FlyingSphere.h"
@@ -9,6 +10,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace ob = ompl::base;
 
@@ -27,6 +29,24 @@ std::shared_ptr<comotion::MultiRobotProblem> makeDirectProblem() {
     problem->setVmax(1.0);
     problem->addRobot(makeSphere(), {0.0, 0.0, 0.0}, {2.0, 0.0, 0.0});
     problem->addRobot(makeSphere(), {0.0, 5.0, 0.0}, {0.0, 6.0, 0.0});
+    return problem;
+}
+
+std::shared_ptr<comotion::MultiRobotProblem> makePrioritizedConnectorProblem() {
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(16);
+    problem->setVmax(1.0);
+    auto first = std::make_shared<comotion::FlyingSphere>(
+        0.4, std::vector<double>{-10.0, -10.0, -10.0},
+        std::vector<double>{10.0, 10.0, 10.0});
+    auto second = std::make_shared<comotion::FlyingSphere>(
+        0.4, std::vector<double>{-10.0, -10.0, -10.0},
+        std::vector<double>{10.0, 10.0, 10.0});
+    // Direct synchronized interpolation collides. The paper connector derives
+    // robot 1 -> robot 0: robot 1 leaves the center first, then robot 0 crosses.
+    problem->addRobot(first, {-1.0, 0.0, 0.0}, {1.0, 0.0, 0.0});
+    problem->addRobot(second, {0.0, 0.0, 0.0}, {0.0, 1.0, 0.0});
     return problem;
 }
 
@@ -184,6 +204,170 @@ bool runLazyAStarCase() {
     return true;
 }
 
+bool runResolutionAwareCrossingCase() {
+    const int checks = comotion::detail::resolutionAwareMotionCheckCount(
+        3, 4.0, 128, 1.0, 3);
+    if (!expectTrue("resolution-aware helper uses timestep checks",
+                    checks == 512))
+        return false;
+
+    comotion::seedOmplGlobalFromUserPlanningSeed(94);
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(128);
+    problem->setVmax(1.0);
+    auto sphere_a = std::make_shared<comotion::FlyingSphere>(
+        0.5, std::vector<double>{-100.0, -100.0, -100.0},
+        std::vector<double>{100.0, 100.0, 100.0});
+    auto sphere_b = std::make_shared<comotion::FlyingSphere>(
+        0.5, std::vector<double>{-100.0, -100.0, -100.0},
+        std::vector<double>{100.0, 100.0, 100.0});
+    problem->addRobot(sphere_a, {-2.0, 0.0, 0.0}, {2.0, 0.0, 0.0});
+    problem->addRobot(sphere_b, {2.0, 0.0, 0.0}, {-2.0, 0.0, 0.0});
+
+    comotion::MRdRRT planner;
+    planner.setProblem(problem);
+    planner.setPlanningSeed(94);
+    planner.setRoadmapSize(2);
+    planner.setIterationsPerBatch(1);
+    planner.setCostMetric(comotion::MRdRRT::CostMetric::Makespan);
+    planner.setTensorSearchMode(comotion::MRdRRT::TensorSearchMode::AStar);
+
+    const auto status = planner.solve(1.0);
+    return expectTrue("resolution-aware edge validation rejects sphere swap",
+                      status != ob::PlannerStatus::EXACT_SOLUTION);
+}
+
+bool runPaperPrioritizedConnectorCase() {
+    comotion::seedOmplGlobalFromUserPlanningSeed(95);
+    auto problem = makePrioritizedConnectorProblem();
+
+    comotion::MRdRRT planner;
+    if (!expectTrue(
+            "paper-prioritized connector is the API default",
+            planner.localConnectorMode() ==
+                comotion::MRdRRT::LocalConnectorMode::PaperPrioritized)) {
+        return false;
+    }
+    planner.setProblem(problem);
+    planner.setPlanningSeed(95);
+    planner.setRoadmapSize(2);
+    planner.setIterationsPerBatch(1);
+    planner.setCostMetric(comotion::MRdRRT::CostMetric::Makespan);
+
+    const auto status = planner.solve(0.5);
+    if (!expectTrue("paper-prioritized connector solves ordered crossing",
+                    status == ob::PlannerStatus::EXACT_SOLUTION)) {
+        return false;
+    }
+
+    const auto &stats = planner.plannerStatsJson();
+    if (!expectTrue(
+            "paper-prioritized connector mode reported",
+            stats.value("local_connector_mode", std::string{}) ==
+                "prioritized") ||
+        !expectTrue("paper-prioritized local connector was used",
+                    stats.value("solution_used_local_connector", false)) ||
+        !expectTrue(
+            "paper-prioritized order is robot 1 then robot 0",
+            stats.contains("solution_local_connector_priority_order") &&
+                stats["solution_local_connector_priority_order"]
+                        .get<std::vector<int>>() == std::vector<int>({1, 0}))) {
+        return false;
+    }
+
+    const auto paths = planner.getSolutionPaths();
+    if (!expectTrue("paper connector emits one path per robot",
+                    paths.size() == 2) ||
+        !expectTrue("paper connector preserves ragged arrival times",
+                    paths[0].size() > paths[1].size())) {
+        return false;
+    }
+
+    const auto &first_start = problem->robot(0).start;
+    const auto &second_goal = problem->robot(1).goal;
+    std::size_t first_robot_moves = 0;
+    while (first_robot_moves < paths[0].size() &&
+           paths[0][first_robot_moves] == first_start) {
+        ++first_robot_moves;
+    }
+    if (!expectTrue("robot 0 waits while robot 1 clears the crossing",
+                    first_robot_moves >= paths[1].size()) ||
+        !expectTrue("robot 1 path ends at its goal",
+                    paths[1].back() == second_goal)) {
+        return false;
+    }
+
+    comotion::CompositePathValidationOptions options;
+    options.check_environment = true;
+    return expectTrue(
+        "emitted paper-connector schedule is backend-valid",
+        problem->collisionChecker().validateCompositePaths(
+            paths, problem->robotModelPtrs(), options));
+}
+
+bool runSynchronizedConnectorOptionCase() {
+    comotion::seedOmplGlobalFromUserPlanningSeed(96);
+    auto problem = makePrioritizedConnectorProblem();
+
+    comotion::MRdRRT planner;
+    planner.setProblem(problem);
+    planner.setPlanningSeed(96);
+    planner.setRoadmapSize(2);
+    planner.setIterationsPerBatch(1);
+    planner.setCostMetric(comotion::MRdRRT::CostMetric::Makespan);
+    planner.setLocalConnectorMode(
+        comotion::MRdRRT::LocalConnectorMode::Synchronized);
+
+    const auto status = planner.solve(0.1);
+    if (!expectTrue(
+            "synchronized connector rejects the same ordered crossing",
+            status != ob::PlannerStatus::EXACT_SOLUTION)) {
+        return false;
+    }
+    const auto &stats = planner.plannerStatsJson();
+    return expectTrue(
+               "synchronized connector mode reported",
+               stats.value("local_connector_mode", std::string{}) ==
+                   "synchronized") &&
+           expectTrue("synchronized connector was attempted",
+                      stats.value("local_connector_attempts",
+                                  std::uint64_t{0}) > 0) &&
+           expectTrue("synchronized connector found no bridge",
+                      stats.value("local_connector_successes",
+                                  std::uint64_t{0}) == 0);
+}
+
+bool runPaperPriorityCycleCase() {
+    comotion::seedOmplGlobalFromUserPlanningSeed(97);
+    auto problem = std::make_shared<comotion::MultiRobotProblem>(
+        comotion::CollisionChecker::Backend::Spheres);
+    problem->setResolution(32);
+    problem->setVmax(1.0);
+    problem->addRobot(makeSphere(), {-1.0, 0.0, 0.0},
+                      {1.0, 0.0, 0.0});
+    problem->addRobot(makeSphere(), {1.0, 0.0, 0.0},
+                      {-1.0, 0.0, 0.0});
+
+    comotion::MRdRRT planner;
+    planner.setProblem(problem);
+    planner.setPlanningSeed(97);
+    planner.setRoadmapSize(2);
+    planner.setIterationsPerBatch(1);
+    const auto status = planner.solve(0.1);
+    if (!expectTrue("cyclic paper-priority graph rejects connector",
+                    status != ob::PlannerStatus::EXACT_SOLUTION)) {
+        return false;
+    }
+    const auto &stats = planner.plannerStatsJson();
+    return expectTrue("cyclic connector was attempted",
+                      stats.value("local_connector_attempts",
+                                  std::uint64_t{0}) > 0) &&
+           expectTrue("cyclic connector did not succeed",
+                      stats.value("local_connector_successes",
+                                  std::uint64_t{0}) == 0);
+}
+
 } // namespace
 
 int main() {
@@ -194,5 +378,9 @@ int main() {
                         "makespan", 2.0);
     ok &= runAStarCase();
     ok &= runLazyAStarCase();
+    ok &= runResolutionAwareCrossingCase();
+    ok &= runPaperPrioritizedConnectorCase();
+    ok &= runSynchronizedConnectorOptionCase();
+    ok &= runPaperPriorityCycleCase();
     return ok ? 0 : 1;
 }

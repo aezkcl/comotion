@@ -196,6 +196,16 @@ bool runVariantCase(const std::string &label, const VampValidationStrategy &stra
                   << path_valid << "\n";
         return false;
     }
+    CompositePathValidationOptions exhaustive_options = options;
+    exhaustive_options.exhaustive = true;
+    const bool exhaustive_path_valid =
+        checker.validateCompositePaths(paths, robots, exhaustive_options);
+    if (exhaustive_path_valid != expected_valid) {
+        std::cerr << "vamp_validation_variants_regression: " << label
+                  << " exhaustive path validity expected " << expected_valid
+                  << " got " << exhaustive_path_valid << "\n";
+        return false;
+    }
 
     auto path_conflict = checker.findFirstCompositePathConflict(paths, robots, options);
     if (expected_valid) {
@@ -235,6 +245,27 @@ bool runVariantCase(const std::string &label, const VampValidationStrategy &stra
         std::cerr << "vamp_validation_variants_regression: " << label
                   << " motion validity expected " << expected_valid << " got "
                   << motion_valid << "\n";
+        return false;
+    }
+    motion_options.exhaustive = true;
+    const bool exhaustive_motion_valid =
+        checker.isCompositeMotionValid(robots, from, to, motion_options);
+    if (exhaustive_motion_valid != expected_valid) {
+        std::cerr << "vamp_validation_variants_regression: " << label
+                  << " exhaustive motion validity expected " << expected_valid
+                  << " got " << exhaustive_motion_valid << "\n";
+        return false;
+    }
+    const auto work = checker.lastValidationWorkStats();
+    if (!expectEqual(label + " exhaustive timesteps checked",
+                     work.motion_timesteps_checked,
+                     work.motion_timesteps_possible) ||
+        !expectEqual(label + " exhaustive robot-state checks",
+                     work.robot_state_checks_completed,
+                     work.robot_state_checks_possible) ||
+        !expectEqual(label + " exhaustive pair checks",
+                     work.robot_pair_checks_completed,
+                     work.robot_pair_checks_possible)) {
         return false;
     }
 
@@ -311,6 +342,25 @@ bool runConflictTraversalCase(
 }  // namespace
 
 int main() {
+    const VampValidationStrategy default_strategy;
+    if (!expectTrue(
+            "default strategy uses combined ordering",
+            default_strategy.ordering == VampBatchOrdering::Combined) ||
+        !expectTrue("default strategy uses rake packing",
+                    default_strategy.packing == VampBatchPacking::Rake)) {
+        return 1;
+    }
+
+    CollisionChecker default_checker(CollisionChecker::Backend::Vamp);
+    const auto checker_default = default_checker.vampValidationStrategy();
+    if (!expectTrue(
+            "VAMP checker defaults to combined ordering",
+            checker_default.ordering == VampBatchOrdering::Combined) ||
+        !expectTrue("VAMP checker defaults to rake packing",
+                    checker_default.packing == VampBatchPacking::Rake)) {
+        return 1;
+    }
+
     const auto linear_layout =
         comotion::detail::makeVampPackingLayouts(0, 20, VampBatchPacking::Linear);
     const auto rake_layout =

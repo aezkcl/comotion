@@ -14,9 +14,19 @@ add_executable(panda_flat
     panda_flat.cpp)
 target_link_libraries(panda_flat PRIVATE comotion)
 
+add_executable(heterogeneous_corridor
+    heterogeneous_corridor.cpp)
+target_link_libraries(heterogeneous_corridor PRIVATE comotion)
+
+add_executable(validation_timing
+    validation_timing.cpp)
+target_link_libraries(validation_timing PRIVATE comotion)
+
 install(TARGETS
     mobile_robot_2d_crossing
     planar_manipulator_cross
     panda_cage
     panda_flat
+    heterogeneous_corridor
+    validation_timing
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

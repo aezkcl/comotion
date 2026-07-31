@@ -54,6 +54,7 @@ struct AppOptions {
     std::string algorithm = "arc";
     comotion::CollisionChecker::Backend collision_backend =
         comotion::CollisionChecker::Backend::Vamp;
+    std::string vamp_validation_strategy = "combined_rake";
     double time_limit = 60.0;
     std::uint32_t seed = 0;
     std::size_t resolution = 128;
@@ -80,13 +81,14 @@ struct AppOptions {
     unsigned int strrt_initial_batch_size = 4096;
     double strrt_initial_time_factor = 4.0;
     double strrt_time_bound_factor_increase = 2.0;
-    bool strrt_shuffle_priority_order = false;
+    bool strrt_shuffle_priority_order = true;
     bool strrt_return_first_solution = true;
     std::string strrt_rewiring = "off";
     int drrt_roadmap_size = 200;
     int drrt_iterations_per_batch = 8;
     std::string drrt_cost_metric = "sum_of_costs";
     std::string drrt_tensor_search = "drrt";
+    std::string drrt_local_connector = "prioritized";
     bool drrt_exclude_roadmap_build_time = false;
     double composite_rrt_range = 0.0;
     bool composite_rrt_simplify_solution = false;
@@ -95,8 +97,26 @@ struct AppOptions {
     std::size_t composite_aorrtc_max_internal_vertices = 10000;
     unsigned int cooperative_rrt_worker_threads = 2;
     int arc_initial_window = 1000;
-    int arc_expansion_step = 1000;
+    double arc_expansion_step = 1000.0;
+    std::string arc_expansion_policy = "linear";
+    std::string arc_expansion_multipliers = "1,1,1,2,2,2,4,8";
+    std::optional<std::string> arc_initial_valid_expansion_policy;
+    std::optional<double> arc_initial_valid_expansion_step;
+    std::optional<std::string> arc_initial_valid_expansion_multipliers;
+    bool arc_initial_valid_expansion_symmetric = true;
+    double arc_cspace_bound_margin = 2.0;
+    double arc_min_cspace_bound_range = 2.0;
+    unsigned int arc_simplification_max_shortcut_steps = 128;
+    unsigned int arc_simplification_max_empty_steps = 32;
+    unsigned int arc_simplification_max_smooth_steps = 1;
+    unsigned int arc_simplification_max_passes = 1;
+    bool arc_conflict_simplification_options_explicit = false;
+    unsigned int arc_conflict_simplification_max_shortcut_steps = 128;
+    unsigned int arc_conflict_simplification_max_empty_steps = 32;
+    unsigned int arc_conflict_simplification_max_smooth_steps = 1;
+    unsigned int arc_conflict_simplification_max_passes = 1;
     unsigned int arc_local_composite_max_samples = 500000;
+    double arc_local_composite_range = 0.0;
     bool arc_local_composite_use_makespan_metric = false;
     bool arc_simplify_initial_solutions = true;
     bool arc_simplify_conflict_solutions = false;
@@ -493,6 +513,8 @@ json generateTasksDoc(const AppOptions &options) {
         throw std::runtime_error("Built-in robot base count does not match --num-robots");
 
     comotion::CollisionChecker checker(options.collision_backend);
+    common::applyVampValidationStrategy(checker,
+                                        options.vamp_validation_strategy);
     checker.setCylinderObstacles(cage_scene::parseCylinderObstacles(doc));
     checker.setObstacles(parseSphereObstacles(doc));
 
@@ -608,6 +630,7 @@ json benchmarkContextJson(const GeneratedScenario &generated,
         {"task_source", generated.task_source},
         {"seed", options.seed},
         {"time_limit_seconds", options.time_limit},
+        {"vamp_validation_strategy", options.vamp_validation_strategy},
         {"resolution", options.resolution},
         {"visual_urdf_path", toRepoRelativePath(visual_urdf)},
         {"collision_urdf_path", toRepoRelativePath(collision_urdf)},
@@ -667,6 +690,8 @@ void writePathArtifacts(const TrialMetrics &metrics,
     json out;
     out["schema_version"] = "1.0";
     out["solver"] = metrics.planner;
+    out["drrt_local_connector"] =
+        common::drrtLocalConnectorSummary(metrics);
     out["collision_backend"] = metrics.collision_backend;
     out["planning_time_seconds"] = metrics.planning_time_seconds;
     out["solve_time_seconds"] = metrics.solve_time_seconds;
@@ -758,6 +783,7 @@ TrialMetrics runPlanner(const GeneratedScenario &generated,
     if (g_app_verbose)
         std::cout << "Running " << planner_name << "\n";
 
+    common::resetValidationTimingForSolve();
     const auto cpu0 = common::processCpuUsageSnapshot();
     const auto t0 = std::chrono::steady_clock::now();
     const auto status = planner->solve(options.time_limit);
@@ -775,6 +801,7 @@ TrialMetrics runPlanner(const GeneratedScenario &generated,
     metrics.planning_time_seconds = solve_time;
     metrics.solve_time_seconds = solve_time;
     metrics.compute_time_seconds = compute_time;
+    common::captureValidationTimingForSolve(metrics);
     metrics.sum_of_cost_timesteps = planner->sumOfCostTimesteps()
                                         ? json(*planner->sumOfCostTimesteps())
                                         : json(nullptr);
@@ -788,6 +815,8 @@ TrialMetrics runPlanner(const GeneratedScenario &generated,
     std::cout << "Status: " << status.asString() << "\n";
     std::cout << "Total planning time: " << solve_time << " seconds\n";
     std::cout << "Total compute time: " << compute_time << " seconds\n";
+    std::cout << "Multi-robot validation time: "
+              << metrics.validation_time_seconds << " seconds\n";
 
     const std::string basename = outputBasename(generated, options);
     if (options.metrics_json_path) {
@@ -829,6 +858,9 @@ void printUsage(const char *prog) {
         << "                         ao_drrt,\n"
         << "                         arc, parallel_arc, stcbs (default: arc)\n"
         << "  --collision-backend <b> sphere, fcl, vamp (default: vamp)\n"
+        << "  --vamp-validation-strategy <s> combined_rake, combined_linear,\n"
+        << "                         hierarchical_rake, hierarchical_linear\n"
+        << "                         (default: combined_rake)\n"
         << "  --time-limit <sec>     Planning time limit (default: 60)\n"
         << "  --seed <n>             Planning seed (default: 0)\n"
         << "  --resolution <n>       Timesteps per second (default: 128)\n"
@@ -841,18 +873,37 @@ void printUsage(const char *prog) {
         << "  --strrt-initial-batch-size <n>  Initial STRRT batch size (default: 4096)\n"
         << "  --strrt-initial-time-factor <x> Initial STRRT time bound factor (default: 4)\n"
         << "  --strrt-time-bound-factor-increase <x> STRRT time bound growth factor (default: 2)\n"
-        << "  --strrt-shuffle-priority-order  Shuffle PrioritizedSTRRT priority order from --seed\n"
+        << "  --strrt-shuffle-priority-order / --no-strrt-shuffle-priority-order\n"
+        << "                         Shuffle PrioritizedSTRRT priority order from --seed (default: on)\n"
         << "  --strrt-return-first-solution <0|1> Stop each STRRT solve at first solution (default: 1)\n"
         << "  --strrt-rewiring <off|radius|knearest> STRRT rewiring mode (default: off)\n"
         << "  --drrt-roadmap-size <n> Override dRRT* roadmap size (default: 200)\n"
         << "  --drrt-iterations-per-batch <n> Override dRRT* batch size (default: 8)\n"
         << "  --drrt-cost-metric <sum_of_costs|composite_l2|makespan>\n"
         << "  --drrt-tensor-search <drrt|astar|lazy_astar> (default: drrt)\n"
+        << "  --drrt-local-connector <prioritized|synchronized> (default: prioritized)\n"
         << "  --drrt-exclude-roadmap-build-time\n"
         << "                         Give dRRT tensor search the full time limit after PRM* build\n"
         << "  --arc-initial-window <n>\n"
-        << "  --arc-expansion-step <n>\n"
+        << "  --arc-expansion-step <x>\n"
+        << "  --arc-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only)\n"
+        << "  --arc-expansion-multipliers <csv> (baseline ARC only; default: 1,1,1,2,2,2,4,8)\n"
+        << "  --arc-initial-valid-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only; default: main policy)\n"
+        << "  --arc-initial-valid-expansion-step <x> (baseline ARC only; default: main step)\n"
+        << "  --arc-initial-valid-expansion-multipliers <csv> (baseline ARC only; default: main multipliers)\n"
+        << "  --arc-initial-valid-symmetric-expansion / --arc-initial-valid-asymmetric-expansion (baseline ARC only; default: symmetric)\n"
+        << "  --arc-cspace-bound-margin <x> (default: 2)\n"
+        << "  --arc-min-cspace-bound-range <x> (default: 2)\n"
+        << "  --arc-simplification-max-shortcut-steps <n> (default: 128)\n"
+        << "  --arc-simplification-max-empty-steps <n> (default: 32)\n"
+        << "  --arc-simplification-max-smooth-steps <n> (default: 1)\n"
+        << "  --arc-simplification-max-passes <n> (default: 1)\n"
+        << "  --arc-conflict-simplification-max-shortcut-steps <n>\n"
+        << "  --arc-conflict-simplification-max-empty-steps <n>\n"
+        << "  --arc-conflict-simplification-max-smooth-steps <n>\n"
+        << "  --arc-conflict-simplification-max-passes <n>\n"
         << "  --arc-local-composite-max-samples <n>\n"
+        << "  --arc-local-composite-range <x> (default: automatic)\n"
         << "  --arc-local-composite-use-makespan-metric\n"
         << "  --arc-simplify-initial-solutions / --no-arc-simplify-initial-solutions (default: on)\n"
         << "  --arc-simplify-conflict-solutions / --no-arc-simplify-conflict-solutions (default: off)\n"
@@ -914,6 +965,8 @@ AppOptions parseArgs(int argc, char **argv) {
         } else if (arg == "--collision-backend") {
             options.collision_backend =
                 parseCollisionBackend(requireValue(i, argc, argv, arg));
+        } else if (arg == "--vamp-validation-strategy") {
+            options.vamp_validation_strategy = requireValue(i, argc, argv, arg);
         } else if (arg == "--time-limit") {
             options.time_limit = std::stod(requireValue(i, argc, argv, arg));
         } else if (arg == "--seed") {
@@ -945,6 +998,8 @@ AppOptions parseArgs(int argc, char **argv) {
                 std::stod(requireValue(i, argc, argv, arg));
         } else if (arg == "--strrt-shuffle-priority-order") {
             options.strrt_shuffle_priority_order = true;
+        } else if (arg == "--no-strrt-shuffle-priority-order") {
+            options.strrt_shuffle_priority_order = false;
         } else if (arg == "--strrt-return-first-solution") {
             options.strrt_return_first_solution =
                 common::parseBoolValue(requireValue(i, argc, argv, arg));
@@ -960,6 +1015,8 @@ AppOptions parseArgs(int argc, char **argv) {
             options.drrt_cost_metric = requireValue(i, argc, argv, arg);
         } else if (arg == "--drrt-tensor-search") {
             options.drrt_tensor_search = requireValue(i, argc, argv, arg);
+        } else if (arg == "--drrt-local-connector") {
+            options.drrt_local_connector = requireValue(i, argc, argv, arg);
         } else if (arg == "--drrt-exclude-roadmap-build-time") {
             options.drrt_exclude_roadmap_build_time = true;
         } else if (arg == "--composite-rrt-use-makespan-metric") {
@@ -988,10 +1045,75 @@ AppOptions parseArgs(int argc, char **argv) {
                 std::stoi(requireValue(i, argc, argv, arg));
         } else if (arg == "--arc-expansion-step") {
             options.arc_expansion_step =
-                std::stoi(requireValue(i, argc, argv, arg));
+                std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--arc-expansion-policy") {
+            options.arc_expansion_policy =
+                requireValue(i, argc, argv, arg);
+        } else if (arg == "--arc-expansion-multipliers") {
+            options.arc_expansion_multipliers =
+                requireValue(i, argc, argv, arg);
+        } else if (arg == "--arc-initial-valid-expansion-policy") {
+            options.arc_initial_valid_expansion_policy =
+                requireValue(i, argc, argv, arg);
+        } else if (arg == "--arc-initial-valid-expansion-step") {
+            options.arc_initial_valid_expansion_step =
+                std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--arc-initial-valid-expansion-multipliers") {
+            options.arc_initial_valid_expansion_multipliers =
+                requireValue(i, argc, argv, arg);
+        } else if (arg == "--arc-initial-valid-symmetric-expansion") {
+            options.arc_initial_valid_expansion_symmetric = true;
+        } else if (arg == "--arc-initial-valid-asymmetric-expansion") {
+            options.arc_initial_valid_expansion_symmetric = false;
+        } else if (arg == "--arc-cspace-bound-margin") {
+            options.arc_cspace_bound_margin =
+                std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--arc-min-cspace-bound-range") {
+            options.arc_min_cspace_bound_range =
+                std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--arc-simplification-max-shortcut-steps") {
+            options.arc_simplification_max_shortcut_steps =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--arc-simplification-max-empty-steps") {
+            options.arc_simplification_max_empty_steps =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--arc-simplification-max-smooth-steps") {
+            options.arc_simplification_max_smooth_steps =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--arc-simplification-max-passes") {
+            options.arc_simplification_max_passes =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg ==
+                   "--arc-conflict-simplification-max-shortcut-steps") {
+            options.arc_conflict_simplification_max_shortcut_steps =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+            options.arc_conflict_simplification_options_explicit = true;
+        } else if (arg == "--arc-conflict-simplification-max-empty-steps") {
+            options.arc_conflict_simplification_max_empty_steps =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+            options.arc_conflict_simplification_options_explicit = true;
+        } else if (arg == "--arc-conflict-simplification-max-smooth-steps") {
+            options.arc_conflict_simplification_max_smooth_steps =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+            options.arc_conflict_simplification_options_explicit = true;
+        } else if (arg == "--arc-conflict-simplification-max-passes") {
+            options.arc_conflict_simplification_max_passes =
+                static_cast<unsigned int>(
+                    std::stoul(requireValue(i, argc, argv, arg)));
+            options.arc_conflict_simplification_options_explicit = true;
         } else if (arg == "--arc-local-composite-max-samples") {
             options.arc_local_composite_max_samples = static_cast<unsigned int>(
                 std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--arc-local-composite-range") {
+            options.arc_local_composite_range =
+                std::stod(requireValue(i, argc, argv, arg));
         } else if (arg == "--arc-local-composite-use-makespan-metric") {
             options.arc_local_composite_use_makespan_metric = true;
         } else if (arg == "--arc-simplify-initial-solutions") {
@@ -1102,6 +1224,9 @@ AppOptions parseArgs(int argc, char **argv) {
         throw std::runtime_error("--drrt-iterations-per-batch must be at least 1");
     (void)common::parseDrrtCostMetric(options.drrt_cost_metric);
     (void)common::parseDrrtTensorSearchMode(options.drrt_tensor_search);
+    (void)common::parseDrrtLocalConnectorMode(options.drrt_local_connector);
+    (void)common::parseVampValidationStrategy(
+        options.vamp_validation_strategy);
     if (options.composite_aorrtc_max_internal_samples == 0)
         throw std::runtime_error(
             "--aorrtc-max-internal-samples must be at least 1");
@@ -1113,8 +1238,35 @@ AppOptions parseArgs(int argc, char **argv) {
             "--cooperative-rrt-worker-threads must be at least 1");
     if (options.arc_initial_window < 1)
         throw std::runtime_error("--arc-initial-window must be at least 1");
-    if (options.arc_expansion_step < 1)
-        throw std::runtime_error("--arc-expansion-step must be at least 1");
+    if (!std::isfinite(options.arc_expansion_step) ||
+        options.arc_expansion_step <= 0.0)
+        throw std::runtime_error("--arc-expansion-step must be positive");
+    (void)common::parseArcExpansionPolicy(options.arc_expansion_policy);
+    (void)common::parseArcExpansionMultipliers(
+        options.arc_expansion_multipliers);
+    if (options.arc_initial_valid_expansion_policy) {
+        (void)common::parseArcExpansionPolicy(
+            *options.arc_initial_valid_expansion_policy);
+    }
+    if (options.arc_initial_valid_expansion_step &&
+        (!std::isfinite(*options.arc_initial_valid_expansion_step) ||
+         *options.arc_initial_valid_expansion_step <= 0.0)) {
+        throw std::runtime_error(
+            "--arc-initial-valid-expansion-step must be positive");
+    }
+    if (options.arc_initial_valid_expansion_multipliers) {
+        (void)common::parseArcExpansionMultipliers(
+            *options.arc_initial_valid_expansion_multipliers);
+    }
+    if (options.arc_cspace_bound_margin < 0.0)
+        throw std::runtime_error(
+            "--arc-cspace-bound-margin must be non-negative");
+    if (options.arc_min_cspace_bound_range < 0.0)
+        throw std::runtime_error(
+            "--arc-min-cspace-bound-range must be non-negative");
+    if (options.arc_local_composite_range < 0.0)
+        throw std::runtime_error(
+            "--arc-local-composite-range must be non-negative");
     (void)parseArcLocalSolverMode(options.arc_local_solvers);
     if (options.or_parallel_worker_processes == 0)
         throw std::runtime_error("--or-parallel-worker-processes must be at least 1");
@@ -1173,6 +1325,8 @@ int main(int argc, char **argv) {
 
         auto problem =
             std::make_shared<comotion::MultiRobotProblem>(options.collision_backend);
+        common::applyVampValidationStrategy(problem,
+                                            options.vamp_validation_strategy);
         for (int i = 0; i < generated.num_robots; ++i) {
             const auto index = static_cast<std::size_t>(i);
             problem->addRobot(robots[index], generated.starts[index],

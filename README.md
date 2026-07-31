@@ -113,7 +113,7 @@ cmake --install build --prefix /path/to/comotion-install
 ```
 
 The install includes the CoMotion CMake package, currently exported as
-`comotion`, workload apps in `bin/`, the three benchmark runners under
+`comotion`, workload apps in `bin/`, benchmark scripts under
 `share/comotion/benchmarks/scripts/`, and the minimal Panda and Planar3 resources
 needed by the public benchmark cases.
 
@@ -134,6 +134,7 @@ cmake --build build --target mobile_robot_2d_crossing
 cmake --build build --target planar_manipulator_cross
 cmake --build build --target panda_cage
 cmake --build build --target panda_flat
+cmake --build build --target heterogeneous_corridor
 ```
 
 They can be run directly, but repeated experiments should use the public
@@ -141,12 +142,14 @@ benchmark runners.
 
 ## Benchmarks
 
-The benchmark interface has exactly three runners:
+Common benchmark entry points:
 
 ```bash
 python3 benchmarks/scripts/run_feasibility.py --num-seeds 5
 python3 benchmarks/scripts/run_anytime.py --num-seeds 5
 python3 benchmarks/scripts/run_multicore.py --num-seeds 5
+python3 benchmarks/scripts/run_planner_trials.py --dry-run
+python3 benchmarks/scripts/plot_results.py path/to/results.csv --plot-backends
 ```
 
 Each runner writes `manifest.json`, `results.csv`, `solution_events.csv`,
@@ -202,6 +205,12 @@ The same citation metadata is available in [CITATION.cff](CITATION.cff).
 ## License
 
 CoMotion is released under the BSD 3-Clause License; see [LICENSE](LICENSE).
+
+Panda model assets and bundled header-only dependencies retain their upstream
+licenses. Their provenance, local modifications, and corresponding license
+texts are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[LICENSES/](LICENSES/). Binary and source distributions install these notices
+alongside the project documentation.
 
 This repository bundles source checkouts of the CoMotion forks of OMPL and
 VAMP. CoMotion OMPL remains under OMPL's BSD 3-Clause License in

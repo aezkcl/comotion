@@ -294,6 +294,10 @@ ompl::base::PlannerStatus STCBS::solve(double timeLimit) {
     const int n = problem_->numRobots();
     const auto params = makeParams();
     const auto start_time = std::chrono::steady_clock::now();
+    const auto deadline =
+        start_time + std::chrono::duration_cast<
+                         std::chrono::steady_clock::duration>(
+                         std::chrono::duration<double>(timeLimit));
     const auto finalizePlannerStats = [&]() {
         nlohmann::json stats = nlohmann::json::object();
         stats["num_conflicts"] = conflict_count_;
@@ -319,7 +323,7 @@ ompl::base::PlannerStatus STCBS::solve(double timeLimit) {
         auto [tree, result] = USTRRTstar::buildTree(
             i, robot.start, robot.goal, *robot.model,
             problem_->collisionChecker(), params, problem_->resolution(),
-            problem_->vmax(), lambda_, planning_seed_);
+            problem_->vmax(), lambda_, planning_seed_, deadline);
         ++ust_rrt_calls_total_;
         const double low_level_elapsed_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -350,11 +354,7 @@ ompl::base::PlannerStatus STCBS::solve(double timeLimit) {
 
     int expanded = 0;
     while (!open.empty() && expanded < max_ct_nodes_) {
-        const double elapsed_seconds = std::chrono::duration<double>(
-                                           std::chrono::steady_clock::now() -
-                                           start_time)
-                                           .count();
-        if (elapsed_seconds >= timeLimit)
+        if (std::chrono::steady_clock::now() >= deadline)
             break;
 
         auto node = open.top();
@@ -414,7 +414,7 @@ ompl::base::PlannerStatus STCBS::solve(double timeLimit) {
             {
                 const auto low_level_start = std::chrono::steady_clock::now();
                 result = USTRRTstar::extendTree(tree, lambda_,
-                                                   max_iterations_);
+                                               max_iterations_, deadline);
                 ++ust_rrt_calls_total_;
                 const double low_level_elapsed_seconds =
                     std::chrono::duration<double>(

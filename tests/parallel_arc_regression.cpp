@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -140,6 +141,18 @@ bool testParallelArcSolvesIndependentConflicts() {
         return false;
 
     const auto planner_json = planner.plannerStatsJson();
+    const auto total_expansions =
+        planner_json.value("temporal_expansions", std::uint64_t{0});
+    const auto initial_valid_expansions = planner_json.value(
+        "initial_valid_temporal_expansions", std::uint64_t{0});
+    const auto main_expansions =
+        planner_json.value("main_temporal_expansions", std::uint64_t{0});
+    if (!expectTrue(
+            "ParallelARC phase expansion counters sum to total",
+            total_expansions ==
+                initial_valid_expansions + main_expansions)) {
+        return false;
+    }
     if (!expectTrue("ParallelARC default conflict finder is segment-parallel",
                     planner_json.value("parallel_arc_conflict_find_mode", "") ==
                         "segment_parallel")) {

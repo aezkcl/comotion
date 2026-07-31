@@ -15,7 +15,25 @@ using Clock = std::chrono::steady_clock;
 void AOARC::configureArcAttempt(ARC &planner) const {
     planner.setInitialWindow(initial_window_);
     planner.setExpansionStep(expansion_step_);
+    planner.setExpansionPolicy(expansion_policy_);
+    planner.setCustomExpansionMultipliers(custom_expansion_multipliers_);
+    if (initial_valid_window_expansion_policy_) {
+        planner.setInitialValidWindowExpansionPolicy(
+            *initial_valid_window_expansion_policy_);
+    }
+    if (initial_valid_window_expansion_step_) {
+        planner.setInitialValidWindowExpansionStep(
+            *initial_valid_window_expansion_step_);
+    }
+    if (initial_valid_window_expansion_multipliers_) {
+        planner.setInitialValidWindowExpansionMultipliers(
+            *initial_valid_window_expansion_multipliers_);
+    }
+    planner.setInitialValidWindowExpansionSymmetric(
+        initial_valid_window_expansion_symmetric_);
     planner.setLocalCompositeRrtMaxSamples(local_composite_rrt_max_samples_);
+    if (local_composite_rrt_range_)
+        planner.setLocalCompositeRrtRange(*local_composite_rrt_range_);
     planner.setLocalCompositeRrtUseMakespanMetric(true);
     planner.setLocalSolverMode(local_solver_mode_);
     planner.setLocalPrioritizedStrrtMaxIterations(
@@ -27,6 +45,10 @@ void AOARC::configureArcAttempt(ARC &planner) const {
     planner.setMinCspaceBoundRange(min_cspace_bound_range_);
     planner.setStrrtSpaceTimeSpanFactor(strrt_space_time_span_factor_);
     planner.setPathSimplificationOptions(simplification_options_);
+    if (conflict_simplification_options_) {
+        planner.setConflictPathSimplificationOptions(
+            *conflict_simplification_options_);
+    }
     planner.setSimplifyInitialSolutions(simplify_initial_solutions_);
     planner.setSimplifyConflictSolutions(simplify_conflict_solutions_);
     planner.setPlanningSeed(planning_seed_);

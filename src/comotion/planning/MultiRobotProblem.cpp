@@ -84,10 +84,10 @@ public:
                      const ompl::base::State *s2) const override {
         CompositePathValidationOptions options;
         options.check_environment = true;
-        options.discrete_num_checks_hint = std::max(
+        const int spatial_checks = std::max(
             1, static_cast<int>(si_->getStateSpace()->validSegmentCount(s1, s2)));
+        double max_dist = 0.0;
         if (vmax_ > 0.0 && resolution_ > 0) {
-            double max_dist = 0.0;
             for (const auto &info : *infos_) {
                 const auto from =
                     extractConfigFromState(s1, info.offset, info.ndof);
@@ -100,11 +100,10 @@ public:
                 }
                 max_dist = std::max(max_dist, std::sqrt(dist_sq));
             }
-            const auto timestep_checks = static_cast<int>(std::ceil(
-                max_dist * static_cast<double>(resolution_) / vmax_));
-            options.discrete_num_checks_hint =
-                std::max(options.discrete_num_checks_hint, timestep_checks);
         }
+        options.discrete_num_checks_hint =
+            detail::resolutionAwareMotionCheckCount(
+                spatial_checks, max_dist, resolution_, vmax_);
 
         std::vector<const RobotModel *> robots;
         std::vector<std::vector<double>> from;

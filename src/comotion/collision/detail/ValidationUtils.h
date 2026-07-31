@@ -3,7 +3,9 @@
 #include "comotion/planning/Path.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 namespace comotion {
@@ -32,6 +34,20 @@ inline std::size_t maxPathLength(const std::vector<Path> &paths) {
     for (const auto &path : paths)
         max_t = std::max(max_t, pathTimestepCount(path));
     return max_t;
+}
+
+inline int resolutionAwareMotionCheckCount(
+    int spatial_checks, double max_distance, std::size_t resolution,
+    double vmax, int minimum_checks = 1) {
+    int checks = std::max(minimum_checks, spatial_checks);
+    if (max_distance <= 0.0 || resolution == 0 || vmax <= 0.0)
+        return checks;
+
+    const double timestep_checks =
+        std::ceil(max_distance * static_cast<double>(resolution) / vmax);
+    if (timestep_checks >= static_cast<double>(std::numeric_limits<int>::max()))
+        return std::numeric_limits<int>::max();
+    return std::max(checks, static_cast<int>(timestep_checks));
 }
 
 inline Path makeMotionPath(const std::vector<double> &from,

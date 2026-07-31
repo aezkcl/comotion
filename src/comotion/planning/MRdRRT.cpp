@@ -1,4 +1,5 @@
 #include "comotion/planning/MRdRRT.h"
+#include "comotion/collision/detail/ValidationUtils.h"
 #include "comotion/planning/PlanningSeed.h"
 #include "comotion/planning/Path.h"
 #include <ompl/geometric/planners/prm/PRMstar.h>
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <optional>
 #include <functional>
+#include <iterator>
 #include <queue>
 
 namespace comotion {
@@ -54,6 +56,16 @@ const char *MRdRRT::tensorSearchModeName(const TensorSearchMode mode) {
         return "astar";
     case TensorSearchMode::LazyAStar:
         return "lazy_astar";
+    }
+    return "unknown";
+}
+
+const char *MRdRRT::localConnectorModeName(const LocalConnectorMode mode) {
+    switch (mode) {
+    case LocalConnectorMode::PaperPrioritized:
+        return "prioritized";
+    case LocalConnectorMode::Synchronized:
+        return "synchronized";
     }
     return "unknown";
 }
@@ -353,6 +365,27 @@ std::vector<Path> MRdRRT::pathsFromCompositePath(
     return paths;
 }
 
+std::vector<Path> MRdRRT::appendLocalConnection(
+    const std::vector<Path> &tree_paths,
+    const std::vector<Path> &local_paths) const {
+    if (tree_paths.size() != local_paths.size())
+        return {};
+
+    std::vector<Path> combined = tree_paths;
+    for (std::size_t r = 0; r < combined.size(); ++r) {
+        const auto &local = local_paths[r];
+        if (combined[r].empty()) {
+            combined[r] = local;
+        } else if (!local.empty()) {
+            combined[r].insert(combined[r].end(), std::next(local.begin()),
+                               local.end());
+        }
+        if (!combined[r].empty())
+            combined[r].markDenseTimestepsImplicit();
+    }
+    return combined;
+}
+
 MRdRRT::CompositeVertex MRdRRT::directionOracle(
     const CompositeVertex &v_near,
     const std::vector<std::vector<double>> &q_rand) const {
@@ -463,7 +496,13 @@ bool MRdRRT::isCompositeEdgeValid(const CompositeVertex &from,
     }
 
     const double longest_valid_segment = longest_valid_segment_cache_;
-    int num_checks = std::max(3, static_cast<int>(std::ceil(edge_distance / longest_valid_segment)) - 1);
+    const int spatial_checks =
+        std::max(3, static_cast<int>(
+                        std::ceil(edge_distance / longest_valid_segment)) -
+                        1);
+    const int num_checks = detail::resolutionAwareMotionCheckCount(
+        spatial_checks, edge_distance, problem_->resolution(), problem_->vmax(),
+        3);
 
     std::vector<std::vector<double>> from_configs(static_cast<std::size_t>(n));
     std::vector<std::vector<double>> to_configs(static_cast<std::size_t>(n));
@@ -482,7 +521,240 @@ bool MRdRRT::isCompositeEdgeValid(const CompositeVertex &from,
     return ok;
 }
 
-bool MRdRRT::localConnector(
+std::optional<std::vector<int>> MRdRRT::shortestIndividualRoadmapPath(
+    const int robot_index, const int start_vertex, const int goal_vertex,
+    const std::chrono::steady_clock::time_point deadline) const {
+    if (robot_index < 0 ||
+        robot_index >= static_cast<int>(roadmaps_.size())) {
+        return std::nullopt;
+    }
+
+    const Roadmap &roadmap = roadmaps_[static_cast<std::size_t>(robot_index)];
+    const int vertex_count = static_cast<int>(roadmap.vertices.size());
+    if (start_vertex < 0 || start_vertex >= vertex_count || goal_vertex < 0 ||
+        goal_vertex >= vertex_count) {
+        return std::nullopt;
+    }
+    if (start_vertex == goal_vertex)
+        return std::vector<int>{start_vertex};
+
+    const double infinity = std::numeric_limits<double>::infinity();
+    std::vector<double> distance(static_cast<std::size_t>(vertex_count), infinity);
+    std::vector<int> parent(static_cast<std::size_t>(vertex_count), -1);
+    using QueueEntry = std::pair<double, int>;
+    std::priority_queue<QueueEntry, std::vector<QueueEntry>,
+                        std::greater<QueueEntry>>
+        open;
+    distance[static_cast<std::size_t>(start_vertex)] = 0.0;
+    open.push({0.0, start_vertex});
+
+    while (!open.empty()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return std::nullopt;
+
+        const auto [current_distance, vertex] = open.top();
+        open.pop();
+        if (current_distance >
+            distance[static_cast<std::size_t>(vertex)] + 1e-12) {
+            continue;
+        }
+        if (vertex == goal_vertex)
+            break;
+
+        for (const int neighbor :
+             roadmap.adjacency[static_cast<std::size_t>(vertex)]) {
+            if (neighbor < 0 || neighbor >= vertex_count)
+                continue;
+            const double candidate =
+                current_distance +
+                configDistance(
+                    roadmap.vertices[static_cast<std::size_t>(vertex)],
+                    roadmap.vertices[static_cast<std::size_t>(neighbor)]);
+            if (candidate + 1e-12 >=
+                distance[static_cast<std::size_t>(neighbor)]) {
+                continue;
+            }
+            distance[static_cast<std::size_t>(neighbor)] = candidate;
+            parent[static_cast<std::size_t>(neighbor)] = vertex;
+            open.push({candidate, neighbor});
+        }
+    }
+
+    if (!std::isfinite(distance[static_cast<std::size_t>(goal_vertex)]))
+        return std::nullopt;
+
+    std::vector<int> path;
+    for (int vertex = goal_vertex; vertex >= 0;
+         vertex = parent[static_cast<std::size_t>(vertex)]) {
+        path.push_back(vertex);
+        if (vertex == start_vertex)
+            break;
+    }
+    if (path.empty() || path.back() != start_vertex)
+        return std::nullopt;
+    std::reverse(path.begin(), path.end());
+    return path;
+}
+
+Path MRdRRT::denseIndividualRoadmapPath(
+    const int robot_index, const std::vector<int> &vertex_path) const {
+    Path path;
+    const Roadmap &roadmap = roadmaps_[static_cast<std::size_t>(robot_index)];
+    path.reserve(vertex_path.size());
+    for (const int vertex : vertex_path)
+        path.push_back(roadmap.vertices[static_cast<std::size_t>(vertex)]);
+
+    if (path.size() >= 2) {
+        path.computeTimestepsFromDistance(problem_->resolution(),
+                                          problem_->vmax());
+        path.interpolate_to_timesteps(problem_->resolution(), problem_->vmax());
+    } else if (!path.empty()) {
+        path.markDenseTimestepsImplicit();
+    }
+    return path;
+}
+
+std::optional<MRdRRT::LocalConnection>
+MRdRRT::paperPrioritizedLocalConnector(
+    const CompositeVertex &from, const CompositeVertex &goal,
+    const std::chrono::steady_clock::time_point deadline) const {
+    const int n = static_cast<int>(from.vertex_ids.size());
+    if (goal.vertex_ids.size() != from.vertex_ids.size() ||
+        problem_->vmax() <= 0.0 || problem_->resolution() == 0) {
+        return std::nullopt;
+    }
+
+    const auto &checker = problem_->collisionChecker();
+    std::vector<Path> individual_paths(static_cast<std::size_t>(n));
+    double connector_cost = 0.0;
+    for (int r = 0; r < n; ++r) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return std::nullopt;
+        const auto vertex_path = shortestIndividualRoadmapPath(
+            r, from.vertex_ids[static_cast<std::size_t>(r)],
+            goal.vertex_ids[static_cast<std::size_t>(r)], deadline);
+        if (!vertex_path)
+            return std::nullopt;
+        Path path = denseIndividualRoadmapPath(r, *vertex_path);
+        if (path.empty() ||
+            !checker.isRobotPathValid(*problem_->robot(r).model, path)) {
+            return std::nullopt;
+        }
+        connector_cost += path.path_cost();
+        individual_paths[static_cast<std::size_t>(r)] = std::move(path);
+    }
+
+    std::vector<std::vector<int>> precedence(static_cast<std::size_t>(n));
+    std::vector<int> indegree(static_cast<std::size_t>(n), 0);
+    std::vector<Path> stationary_starts(static_cast<std::size_t>(n));
+    std::vector<Path> stationary_goals(static_cast<std::size_t>(n));
+    for (int r = 0; r < n; ++r) {
+        stationary_starts[static_cast<std::size_t>(r)].push_back(
+            individual_paths[static_cast<std::size_t>(r)].front());
+        stationary_starts[static_cast<std::size_t>(r)]
+            .markDenseTimestepsImplicit();
+        stationary_goals[static_cast<std::size_t>(r)].push_back(
+            individual_paths[static_cast<std::size_t>(r)].back());
+        stationary_goals[static_cast<std::size_t>(r)]
+            .markDenseTimestepsImplicit();
+    }
+    const auto addPrecedence = [&](const int before, const int after) {
+        auto &neighbors = precedence[static_cast<std::size_t>(before)];
+        if (std::find(neighbors.begin(), neighbors.end(), after) !=
+            neighbors.end()) {
+            return;
+        }
+        neighbors.push_back(after);
+        ++indegree[static_cast<std::size_t>(after)];
+    };
+
+    // Paper Section 4.2:
+    // - collision with j at its anchor => j must move before i;
+    // - collision with j at its target => i must move before j.
+    for (int i = 0; i < n; ++i) {
+        const Path &moving = individual_paths[static_cast<std::size_t>(i)];
+        if (moving.size() < 2)
+            continue;
+        for (int j = 0; j < n; ++j) {
+            if (i == j)
+                continue;
+            if (std::chrono::steady_clock::now() >= deadline)
+                return std::nullopt;
+
+            if (!checker.isPairPathValid(
+                    *problem_->robot(i).model, moving,
+                    *problem_->robot(j).model,
+                    stationary_starts[static_cast<std::size_t>(j)])) {
+                addPrecedence(j, i);
+            }
+
+            if (!checker.isPairPathValid(
+                    *problem_->robot(i).model, moving,
+                    *problem_->robot(j).model,
+                    stationary_goals[static_cast<std::size_t>(j)])) {
+                addPrecedence(i, j);
+            }
+        }
+    }
+
+    std::priority_queue<int, std::vector<int>, std::greater<int>> ready;
+    for (int r = 0; r < n; ++r) {
+        if (indegree[static_cast<std::size_t>(r)] == 0)
+            ready.push(r);
+    }
+
+    std::vector<int> priority_order;
+    priority_order.reserve(static_cast<std::size_t>(n));
+    while (!ready.empty()) {
+        const int robot = ready.top();
+        ready.pop();
+        priority_order.push_back(robot);
+        for (const int after :
+             precedence[static_cast<std::size_t>(robot)]) {
+            int &degree = indegree[static_cast<std::size_t>(after)];
+            --degree;
+            if (degree == 0)
+                ready.push(after);
+        }
+    }
+    if (priority_order.size() != static_cast<std::size_t>(n))
+        return std::nullopt;
+
+    std::vector<Path> schedule(static_cast<std::size_t>(n));
+    std::vector<bool> completed(static_cast<std::size_t>(n), false);
+    for (int r = 0; r < n; ++r) {
+        schedule[static_cast<std::size_t>(r)].push_back(
+            individual_paths[static_cast<std::size_t>(r)].front());
+    }
+
+    // Execute one individual roadmap path at a time. Paths already use dense
+    // timestep sampling. Robots that have not moved yet receive explicit
+    // leading holds; robots already at goal end their path and are held there
+    // by the standard ragged-path clamp semantics.
+    for (const int moving_robot : priority_order) {
+        const Path &moving =
+            individual_paths[static_cast<std::size_t>(moving_robot)];
+        for (std::size_t t = 1; t < moving.size(); ++t) {
+            for (int r = 0; r < n; ++r) {
+                auto &robot_schedule = schedule[static_cast<std::size_t>(r)];
+                if (r == moving_robot) {
+                    robot_schedule.push_back(moving[t]);
+                } else if (!completed[static_cast<std::size_t>(r)]) {
+                    robot_schedule.push_back(robot_schedule.back());
+                }
+            }
+        }
+        completed[static_cast<std::size_t>(moving_robot)] = true;
+    }
+    for (auto &path : schedule)
+        path.markDenseTimestepsImplicit();
+
+    return LocalConnection{std::move(schedule), connector_cost,
+                           std::move(priority_order)};
+}
+
+std::optional<MRdRRT::LocalConnection>
+MRdRRT::synchronizedLocalConnector(
     const CompositeVertex &from,
     const std::vector<std::vector<double>> &goal_configs,
     const std::chrono::steady_clock::time_point deadline) const {
@@ -497,11 +769,16 @@ bool MRdRRT::localConnector(
     }
 
     const double longest_valid_segment = longest_valid_segment_cache_;
-    const int num_checks =
-        std::max(3, static_cast<int>(std::ceil(edge_distance / longest_valid_segment)) - 1);
+    const int spatial_checks =
+        std::max(3, static_cast<int>(
+                        std::ceil(edge_distance / longest_valid_segment)) -
+                        1);
+    const int num_checks = detail::resolutionAwareMotionCheckCount(
+        spatial_checks, edge_distance, problem_->resolution(), problem_->vmax(),
+        3);
 
     if (std::chrono::steady_clock::now() >= deadline)
-        return false;
+        return std::nullopt;
 
     std::vector<std::vector<double>> from_configs(static_cast<std::size_t>(n));
     for (int r = 0; r < n; ++r) {
@@ -512,8 +789,43 @@ bool MRdRRT::localConnector(
     CompositePathValidationOptions options;
     options.check_environment = true;
     options.discrete_num_checks_hint = num_checks;
-    return problem_->collisionChecker().isCompositeMotionValid(
-        ptrs, from_configs, goal_configs, options);
+    if (!problem_->collisionChecker().isCompositeMotionValid(
+            ptrs, from_configs, goal_configs, options)) {
+        return std::nullopt;
+    }
+
+    std::vector<Path> paths(static_cast<std::size_t>(n));
+    const double segment_seconds =
+        problem_->vmax() > 0.0 ? edge_distance / problem_->vmax() : 0.0;
+    for (int r = 0; r < n; ++r) {
+        Path &path = paths[static_cast<std::size_t>(r)];
+        path.push_back(from_configs[static_cast<std::size_t>(r)]);
+        path.push_back(goal_configs[static_cast<std::size_t>(r)]);
+        path.setTimestepsFromSegmentTimes({segment_seconds},
+                                          problem_->resolution());
+        path.interpolate_to_timesteps(problem_->resolution(), problem_->vmax());
+    }
+    return LocalConnection{std::move(paths),
+                           localEdgeCost(from, goal_configs), {}};
+}
+
+std::optional<MRdRRT::LocalConnection> MRdRRT::localConnector(
+    const CompositeVertex &from, const CompositeVertex &goal,
+    const std::vector<std::vector<double>> &goal_configs,
+    const std::chrono::steady_clock::time_point deadline) const {
+    ++local_connector_attempts_;
+    std::optional<LocalConnection> result;
+    switch (local_connector_mode_) {
+    case LocalConnectorMode::PaperPrioritized:
+        result = paperPrioritizedLocalConnector(from, goal, deadline);
+        break;
+    case LocalConnectorMode::Synchronized:
+        result = synchronizedLocalConnector(from, goal_configs, deadline);
+        break;
+    }
+    if (result)
+        ++local_connector_successes_;
+    return result;
 }
 
 std::vector<MRdRRT::CompositeVertex> MRdRRT::traceTreePathToRoot(
@@ -525,19 +837,18 @@ std::vector<MRdRRT::CompositeVertex> MRdRRT::traceTreePathToRoot(
     return rev;
 }
 
-std::optional<std::vector<MRdRRT::CompositeVertex>> MRdRRT::connectToTarget(
+std::optional<MRdRRT::TargetConnection> MRdRRT::connectToTarget(
     const CompositeVertex &goal_v,
     const std::unordered_map<CompositeVertex, int, CompositeVertexHash>
         &vertex_to_node,
     const uint64_t total_iteration,
-    const std::chrono::steady_clock::time_point deadline,
-    double *path_cost) const {
+    const std::chrono::steady_clock::time_point deadline) const {
 
     auto git = vertex_to_node.find(goal_v);
     if (git != vertex_to_node.end()) {
-        if (path_cost)
-            *path_cost = tree_[git->second].cost;
-        return traceTreePathToRoot(git->second);
+        const auto tree_path = traceTreePathToRoot(git->second);
+        return TargetConnection{pathsFromCompositePath(tree_path),
+                                tree_[git->second].cost, false, {}};
     }
 
     const int n = static_cast<int>(goal_v.vertex_ids.size());
@@ -568,7 +879,7 @@ std::optional<std::vector<MRdRRT::CompositeVertex>> MRdRRT::connectToTarget(
     std::partial_sort(ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(k),
                       ranked.end(), dist_less);
 
-    std::optional<std::vector<CompositeVertex>> best_path;
+    std::optional<TargetConnection> best_connection;
     double best_cost = std::numeric_limits<double>::infinity();
     for (size_t j = 0; j < k; ++j) {
         if (std::chrono::steady_clock::now() >= deadline)
@@ -578,31 +889,30 @@ std::optional<std::vector<MRdRRT::CompositeVertex>> MRdRRT::connectToTarget(
         if (local_connect_failed_.count(anchor)) {
             continue;
         }
-        if (!localConnector(anchor, goal_configs, deadline)) {
+        auto local =
+            localConnector(anchor, goal_v, goal_configs, deadline);
+        if (!local) {
             local_connect_failed_.insert(anchor);
             continue;
         }
-        const double candidate_last_edge_cost =
-            localEdgeCost(anchor, goal_configs);
         const double candidate_cost =
-            tree_[tree_idx].cost + candidate_last_edge_cost;
+            tree_[tree_idx].cost + local->cost;
         if (candidate_cost + 1e-12 >= best_cost)
             continue;
-        std::vector<CompositeVertex> path = traceTreePathToRoot(tree_idx);
-        path.push_back(goal_v);
+        const auto tree_path = traceTreePathToRoot(tree_idx);
+        auto paths = appendLocalConnection(
+            pathsFromCompositePath(tree_path), local->paths);
+        if (paths.empty())
+            continue;
         best_cost = candidate_cost;
-        best_path = std::move(path);
+        best_connection =
+            TargetConnection{std::move(paths), candidate_cost, true,
+                             std::move(local->priority_order)};
         if (stop_at_first_solution_)
             break;
     }
 
-    if (best_path) {
-        if (path_cost)
-            *path_cost = best_cost;
-        return best_path;
-    }
-
-    return std::nullopt;
+    return best_connection;
 }
 
 int MRdRRT::findNearestNode(
@@ -1385,6 +1695,10 @@ ompl::base::PlannerStatus MRdRRT::solve(double timeLimit) {
     solution_paths_.clear();
     tree_.clear();
     local_connect_failed_.clear();
+    local_connector_attempts_ = 0;
+    local_connector_successes_ = 0;
+    solution_used_local_connector_ = false;
+    solution_local_connector_priority_order_.clear();
 
     int n = problem_->numRobots();
     auto start_time = std::chrono::steady_clock::now();
@@ -1398,6 +1712,14 @@ ompl::base::PlannerStatus MRdRRT::solve(double timeLimit) {
         nlohmann::json stats = nlohmann::json::object();
         stats["cost_metric"] = costMetricName(cost_metric_);
         stats["tensor_search_mode"] = tensorSearchModeName(tensor_search_mode_);
+        stats["local_connector_mode"] =
+            localConnectorModeName(local_connector_mode_);
+        stats["local_connector_attempts"] = local_connector_attempts_;
+        stats["local_connector_successes"] = local_connector_successes_;
+        stats["solution_used_local_connector"] =
+            solution_used_local_connector_;
+        stats["solution_local_connector_priority_order"] =
+            solution_local_connector_priority_order_;
         stats["stop_at_first_solution"] = stop_at_first_solution_;
         stats["use_star_rewiring"] = use_star_rewiring_;
         stats["roadmap_size"] = roadmap_size_;
@@ -1569,15 +1891,18 @@ ompl::base::PlannerStatus MRdRRT::solve(double timeLimit) {
             rewireFrom(new_idx);
         }
 
-        double candidate_cost = std::numeric_limits<double>::infinity();
-        std::optional<std::vector<CompositeVertex>> cv_path = connectToTarget(
-            goal_v, vertex_to_node, rrt_iter, solve_deadline, &candidate_cost);
+        std::optional<TargetConnection> target_connection = connectToTarget(
+            goal_v, vertex_to_node, rrt_iter, solve_deadline);
 
-        if (cv_path.has_value()) {
-            if (candidate_cost + 1e-12 < best_solution_cost) {
-                solution_paths_ = pathsFromCompositePath(*cv_path);
+        if (target_connection.has_value()) {
+            if (target_connection->cost + 1e-12 < best_solution_cost) {
+                solution_paths_ = target_connection->paths;
                 setSolutionMetricsFromPaths(solution_paths_);
-                best_solution_cost = candidate_cost;
+                best_solution_cost = target_connection->cost;
+                solution_used_local_connector_ =
+                    target_connection->used_local_connector;
+                solution_local_connector_priority_order_ =
+                    target_connection->priority_order;
 
                 solution_events.push_back({
                     {"elapsed_seconds",
@@ -1585,7 +1910,13 @@ ompl::base::PlannerStatus MRdRRT::solve(double timeLimit) {
                          std::chrono::steady_clock::now() - accounting_start_time)
                          .count()},
                     {"cost_metric", costMetricName(cost_metric_)},
-                    {"solution_cost", candidate_cost},
+                    {"solution_cost", target_connection->cost},
+                    {"local_connector_mode",
+                     localConnectorModeName(local_connector_mode_)},
+                    {"used_local_connector",
+                     target_connection->used_local_connector},
+                    {"local_connector_priority_order",
+                     target_connection->priority_order},
                     {"makespan_timesteps",
                      makespanTimesteps() ? nlohmann::json(*makespanTimesteps())
                                          : nlohmann::json(nullptr)},

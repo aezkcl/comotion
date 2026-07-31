@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out recursively
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            cmake ninja-build pkg-config \
+            libboost-all-dev libeigen3-dev libfcl-dev python3
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCOMOTION_BUILD_APPS=ON
+          -DCOMOTION_BUILD_EXAMPLES=ON
+          -DCOMOTION_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        run: |
+          ctest --test-dir build --output-on-failure
+          python3 -m unittest benchmarks.tests.test_run_planner_trials
+
+      - name: Install and exercise packaged FCL resources
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/comotion-install"
+          cmake -S examples -B "$RUNNER_TEMP/comotion-examples-build" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/comotion-install"
+          cmake --build "$RUNNER_TEMP/comotion-examples-build"
+          "$RUNNER_TEMP/comotion-examples-build/comotion_library_smoke"
+          "$RUNNER_TEMP/comotion-install/bin/panda_cage" \
+            --num-robots 2 \
+            --task-index 0 \
+            --algorithm prioritized \
+            --collision-backend fcl \
+            --time-limit 0.01 \
+            --seed 0 \
+            --metrics-json "$RUNNER_TEMP/installed-fcl-smoke.json"
+          test -s "$RUNNER_TEMP/installed-fcl-smoke.json"
+
+      - name: Build and inspect source package
+        run: |
+          cpack --config build/CPackSourceConfig.cmake -G TGZ
+          tar -tzf CoMotion-*.tar.gz > "$RUNNER_TEMP/source-package-files.txt"
+          grep -q '/resources/panda/panda.urdf$' "$RUNNER_TEMP/source-package-files.txt"
+          grep -q '/resources/panda/meshes/collision/link0.obj$' "$RUNNER_TEMP/source-package-files.txt"
+          grep -q '/THIRD_PARTY_NOTICES.md$' "$RUNNER_TEMP/source-package-files.txt"

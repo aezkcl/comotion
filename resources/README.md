@@ -9,9 +9,9 @@ Included resource families:
 - Planar3
 
 The `*_spherized.urdf` files provide conservative sphere decompositions used by
-the sphere, VAMP, and FCL collision backends in the public benchmark workloads.
-The public source tree intentionally ships only the minimal Panda and Planar3
-URDF/SRDF files required by the benchmark runners.
+the sphere and VAMP collision backends. The Panda mesh URDF and collision meshes
+support the FCL benchmark backend. The public source tree intentionally ships
+only the Panda and Planar3 models required by the benchmark runners.
 
 Large unused robot families, problem archives, demo media, heightfields, and
 legacy conversion helpers were removed from the public source tree. The public
@@ -25,4 +25,4 @@ The table below records the release status visible from this repository.
 | Resource | Contents | Release status |
 | --- | --- | --- |
 | `planar3/` | Synthetic planar manipulator URDF, SRDF, and sphere model | Local synthetic model. |
-| `panda/` | Panda SRDF and spherized collision model | Derived benchmark model. No Panda mesh assets are redistributed. Verify upstream attribution before release if replacing these files with external robot assets. |
+| `panda/` | Panda URDF/SRDF, conservative sphere model, and collision meshes | Derived from the VAMP/Robowflex Panda resources. See `THIRD_PARTY_NOTICES.md` and `LICENSES/` at the repository root. CoMotion changes the generated mesh URDF to use the packaged collision meshes for both collision and visualization so installed examples are self-contained. |

@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <set>
+#include <tuple>
 #if !defined(_WIN32)
 #include <sys/resource.h>
 #endif
@@ -82,6 +83,20 @@ const char *arcLocalSolverModeStr(comotion::ARC::LocalSolverMode mode) {
     return "unknown";
 }
 
+const char *arcExpansionPolicyStr(comotion::ARC::ExpansionPolicy policy) {
+    switch (policy) {
+    case comotion::ARC::ExpansionPolicy::Linear:
+        return "linear";
+    case comotion::ARC::ExpansionPolicy::Logarithmic:
+        return "logarithmic";
+    case comotion::ARC::ExpansionPolicy::Exponential:
+        return "exponential";
+    case comotion::ARC::ExpansionPolicy::CustomMultiplied:
+        return "multiplied";
+    }
+    return "unknown";
+}
+
 bool arcRepairWindowsIntersect(int lhs_start, int lhs_end, int rhs_start,
                                int rhs_end) {
     return lhs_start <= rhs_end && rhs_start <= lhs_end;
@@ -122,6 +137,269 @@ public:
 
 namespace comotion {
 
+namespace {
+
+void validateArcExpansionMultipliers(
+    const std::vector<double> &multipliers, const char *schedule_name) {
+    if (multipliers.empty()) {
+        std::ostringstream message;
+        message << "ARC " << schedule_name
+                << " expansion multiplier sequence must not be empty";
+        throw std::invalid_argument(message.str());
+    }
+    for (std::size_t i = 0; i < multipliers.size(); ++i) {
+        if (!std::isfinite(multipliers[i]) || multipliers[i] <= 0.0) {
+            std::ostringstream message;
+            message << "ARC " << schedule_name << " expansion multiplier " << i
+                    << " must be finite and positive";
+            throw std::invalid_argument(message.str());
+        }
+    }
+}
+
+} // namespace
+
+void ARC::setCustomExpansionMultipliers(std::vector<double> multipliers) {
+    validateArcExpansionMultipliers(multipliers, "custom");
+    custom_expansion_multipliers_ = std::move(multipliers);
+}
+
+void ARC::setInitialValidWindowExpansionMultipliers(
+    std::vector<double> multipliers) {
+    validateArcExpansionMultipliers(multipliers, "initial-valid custom");
+    initial_valid_window_expansion_multipliers_ = std::move(multipliers);
+}
+
+std::pair<int, int>
+ARC::nextExpansionWindow(int start_t, int end_t, std::size_t max_t,
+                         std::size_t expansion_index) const {
+    return nextExpansionWindowWithSettings(
+        start_t, end_t, max_t, expansion_index, expansion_policy_,
+        expansion_step_, custom_expansion_multipliers_);
+}
+
+std::pair<int, int> ARC::nextInitialValidExpansionWindow(
+    int start_t, int end_t, std::size_t max_t,
+    std::size_t expansion_index) const {
+    return nextExpansionWindowWithSettings(
+        start_t, end_t, max_t, expansion_index,
+        initialValidWindowExpansionPolicy(),
+        initialValidWindowExpansionStep(),
+        initialValidWindowExpansionMultipliers());
+}
+
+std::pair<int, int> ARC::symmetricWindowFromGeometry(
+    std::int64_t center_twice, std::int64_t half_width_twice,
+    std::size_t max_t) const {
+    const long double raw_start =
+        (static_cast<long double>(center_twice) -
+         static_cast<long double>(half_width_twice)) /
+        2.0L;
+    const long double raw_end =
+        (static_cast<long double>(center_twice) +
+         static_cast<long double>(half_width_twice)) /
+        2.0L;
+    const int start_t = static_cast<int>(std::max<long double>(
+        0.0L, std::floor(raw_start)));
+    const int end_t = static_cast<int>(std::min<long double>(
+        static_cast<long double>(max_t), std::ceil(raw_end)));
+    return {start_t, end_t};
+}
+
+std::pair<int, int> ARC::absoluteExpansionWindow(
+    int start_t, int end_t, std::size_t max_t,
+    std::size_t expansion_index, ExpansionPolicy policy,
+    double configured_expansion_step,
+    const std::vector<double> &custom_multipliers,
+    std::int64_t center_twice,
+    std::int64_t base_half_width_twice) const {
+    const auto global_window =
+        std::make_pair(0, static_cast<int>(max_t));
+    if (start_t == 0 &&
+        static_cast<std::size_t>(std::max(0, end_t)) >= max_t) {
+        return global_window;
+    }
+
+    long double target_half_width_twice =
+        static_cast<long double>(
+            std::max<std::int64_t>(1, base_half_width_twice));
+    const long double expansion_step =
+        static_cast<long double>(
+            std::isfinite(configured_expansion_step) &&
+                    configured_expansion_step > 0.0
+                ? configured_expansion_step
+                : 1.0);
+    switch (policy) {
+    case ExpansionPolicy::Linear:
+        target_half_width_twice +=
+            2.0L * expansion_step *
+            (static_cast<long double>(expansion_index) + 1.0L);
+        break;
+    case ExpansionPolicy::Logarithmic:
+        target_half_width_twice +=
+            2.0L * expansion_step *
+            std::log2(static_cast<long double>(expansion_index) + 2.0L);
+        break;
+    case ExpansionPolicy::Exponential:
+        target_half_width_twice +=
+            2.0L * std::ldexp(
+                         expansion_step,
+                         expansion_index >=
+                                 static_cast<std::size_t>(
+                                     std::numeric_limits<int>::max())
+                             ? std::numeric_limits<int>::max()
+                             : static_cast<int>(expansion_index));
+        break;
+    case ExpansionPolicy::CustomMultiplied:
+        if (expansion_index >= custom_multipliers.size())
+            return global_window;
+        target_half_width_twice =
+            static_cast<long double>(
+                std::max<std::int64_t>(1, base_half_width_twice)) *
+            static_cast<long double>(
+                custom_multipliers[expansion_index]);
+        break;
+    }
+
+    const auto half_width_twice =
+        !std::isfinite(target_half_width_twice) ||
+                target_half_width_twice >=
+                    static_cast<long double>(
+                        std::numeric_limits<std::int64_t>::max())
+            ? std::numeric_limits<std::int64_t>::max()
+            : static_cast<std::int64_t>(
+                  std::ceil(target_half_width_twice));
+    auto next = symmetricWindowFromGeometry(
+        center_twice, std::max<std::int64_t>(1, half_width_twice), max_t);
+
+    // Repeated custom entries intentionally restart the local solver at the
+    // same bounds. For formula-based schedules, a repeated/clipped size means
+    // no further useful local growth, so make the next attempt global.
+    if (policy != ExpansionPolicy::CustomMultiplied &&
+        next.first == start_t && next.second == end_t) {
+        return global_window;
+    }
+
+    if (policy == ExpansionPolicy::Logarithmic) {
+        const std::size_t ten_percent = max_t / 10;
+        const std::size_t left_gap =
+            static_cast<std::size_t>(std::max(0, next.first));
+        const std::size_t right_gap =
+            max_t - std::min(
+                        static_cast<std::size_t>(
+                            std::max(0, next.second)),
+                        max_t);
+        if (left_gap <= ten_percent && right_gap <= ten_percent)
+            return global_window;
+    }
+    return next;
+}
+
+void ARC::establishMainWindowGeometry(
+    int start_t, int end_t, ExpansionScheduleState &state) const {
+    if (state.initial_valid_window_established)
+        return;
+    state.initial_valid_window_established = true;
+    state.main_window_center_twice =
+        static_cast<std::int64_t>(start_t) +
+        static_cast<std::int64_t>(end_t);
+    state.main_base_half_width_twice =
+        std::max<std::int64_t>(
+            1, static_cast<std::int64_t>(end_t) -
+                   static_cast<std::int64_t>(start_t));
+}
+
+std::pair<int, int> ARC::nextInitialValidExpansionWindow(
+    int start_t, int end_t, std::size_t max_t,
+    std::size_t expansion_index, bool start_valid, bool goal_valid,
+    const ExpansionScheduleState &state) const {
+    const auto policy = initialValidWindowExpansionPolicy();
+    const auto candidate = absoluteExpansionWindow(
+        start_t, end_t, max_t, expansion_index, policy,
+        initialValidWindowExpansionStep(),
+        initialValidWindowExpansionMultipliers(),
+        state.initial_search_center_twice,
+        state.initial_search_half_width_twice);
+
+    // Endpoint search never shrinks a side. In asymmetric mode, a side whose
+    // endpoint is already valid remains anchored while only invalid sides grow.
+    const bool expand_start =
+        initial_valid_window_expansion_symmetric_ || !start_valid;
+    const bool expand_goal =
+        initial_valid_window_expansion_symmetric_ || !goal_valid;
+    const std::pair<int, int> next{
+        expand_start ? std::min(start_t, candidate.first) : start_t,
+        expand_goal ? std::max(end_t, candidate.second) : end_t,
+    };
+    if (policy != ExpansionPolicy::CustomMultiplied &&
+        next.first == start_t && next.second == end_t) {
+        return {0, static_cast<int>(max_t)};
+    }
+    return next;
+}
+
+std::pair<int, int> ARC::nextMainExpansionWindow(
+    int start_t, int end_t, std::size_t max_t,
+    std::size_t expansion_index,
+    const ExpansionScheduleState &state) const {
+    return absoluteExpansionWindow(
+        start_t, end_t, max_t, expansion_index, expansion_policy_,
+        expansion_step_, custom_expansion_multipliers_,
+        state.main_window_center_twice,
+        state.main_base_half_width_twice);
+}
+
+std::pair<int, int> ARC::nextExpansionWindowAfterAttempt(
+    int start_t, int end_t, std::size_t max_t,
+    bool start_valid, bool goal_valid,
+    ExpansionScheduleState &state) const {
+    if (!state.initial_search_geometry_initialized) {
+        state.initial_search_geometry_initialized = true;
+        state.initial_search_center_twice =
+            static_cast<std::int64_t>(start_t) +
+            static_cast<std::int64_t>(end_t);
+        state.initial_search_half_width_twice =
+            std::max<std::int64_t>(
+                1, static_cast<std::int64_t>(end_t) -
+                       static_cast<std::int64_t>(start_t));
+    }
+    if (start_valid && goal_valid)
+        establishMainWindowGeometry(start_t, end_t, state);
+
+    state.last_expansion_used_initial_valid_schedule =
+        !state.initial_valid_window_established;
+    if (state.last_expansion_used_initial_valid_schedule) {
+        const auto next = nextInitialValidExpansionWindow(
+            start_t, end_t, max_t, state.initial_valid_expansion_index,
+            start_valid, goal_valid, state);
+        ++state.initial_valid_expansion_index;
+        return next;
+    }
+
+    const auto next = nextMainExpansionWindow(
+        start_t, end_t, max_t, state.main_expansion_index, state);
+    ++state.main_expansion_index;
+    return next;
+}
+
+std::pair<int, int> ARC::nextExpansionWindowWithSettings(
+    int start_t, int end_t, std::size_t max_t,
+    std::size_t expansion_index, ExpansionPolicy policy,
+    double configured_expansion_step,
+    const std::vector<double> &custom_multipliers) const {
+    const auto center_twice =
+        static_cast<std::int64_t>(start_t) +
+        static_cast<std::int64_t>(end_t);
+    const auto base_half_width_twice =
+        std::max<std::int64_t>(
+            1, static_cast<std::int64_t>(end_t) -
+                   static_cast<std::int64_t>(start_t));
+    return absoluteExpansionWindow(
+        start_t, end_t, max_t, expansion_index, policy,
+        configured_expansion_step, custom_multipliers,
+        center_twice, base_half_width_twice);
+}
+
 void ARC::resetArcSolveState() {
     resetPlannerRunMetrics();
     solution_paths_.clear();
@@ -135,22 +413,26 @@ void ARC::resetArcSolveState() {
     num_conflicts_ = 0;
     num_subproblem_attempts_ = 0;
     num_temporal_expansions_ = 0;
+    num_initial_valid_temporal_expansions_ = 0;
+    num_main_temporal_expansions_ = 0;
+    next_repair_attempt_id_ = 0;
+    repair_attempt_events_.clear();
     initial_solution_times_seconds_wall_clock_ = 0.0;
     initial_solution_times_seconds_cpu_ = 0.0;
     initial_simplification_times_seconds_wall_clock_ = 0.0;
     local_composite_simplification_times_seconds_wall_clock_ = 0.0;
     conflict_detection_times_seconds_.clear();
     conflict_detection_times_cpu_seconds_.clear();
-    temporary_conflict_find_main_process_wall_seconds_.clear();
-    temporary_conflict_find_process_tree_cpu_seconds_.clear();
-    temporary_conflict_find_build_worker_wall_seconds_.clear();
-    temporary_conflict_find_build_worker_cpu_seconds_.clear();
-    temporary_conflict_find_collision_worker_wall_seconds_.clear();
-    temporary_conflict_find_collision_worker_cpu_seconds_.clear();
-    temporary_conflict_find_critical_worker_index_.clear();
-    temporary_conflict_find_critical_worker_build_wall_seconds_.clear();
-    temporary_conflict_find_critical_worker_collision_wall_seconds_.clear();
-    temporary_conflict_find_critical_worker_total_wall_seconds_.clear();
+    conflict_find_main_process_wall_seconds_.clear();
+    conflict_find_process_tree_cpu_seconds_.clear();
+    conflict_find_build_worker_wall_seconds_.clear();
+    conflict_find_build_worker_cpu_seconds_.clear();
+    conflict_find_collision_worker_wall_seconds_.clear();
+    conflict_find_collision_worker_cpu_seconds_.clear();
+    conflict_find_critical_worker_index_.clear();
+    conflict_find_critical_worker_build_wall_seconds_.clear();
+    conflict_find_critical_worker_collision_wall_seconds_.clear();
+    conflict_find_critical_worker_total_wall_seconds_.clear();
     conflict_resolution_times_seconds_.clear();
     conflict_resolution_times_cpu_seconds_.clear();
 }
@@ -547,6 +829,12 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                                       max_t));
     if (end_t == 0 && max_t > 0)
         end_t = 1;
+    ExpansionScheduleState expansion_schedule_state;
+    const std::uint64_t repair_id = next_repair_attempt_id_++;
+    std::uint64_t repair_attempt_index = 0;
+    RepairAttemptPhase current_attempt_phase =
+        RepairAttemptPhase::InitialWindow;
+    std::optional<std::size_t> current_expansion_index;
 
     const auto recordWindow = [&]() {
         if (window_start_t_out)
@@ -558,14 +846,36 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
     for (;;) {
         recordWindow();
         ++num_subproblem_attempts_;
+        RepairAttemptEvent attempt_event;
+        attempt_event.repair_id = repair_id;
+        attempt_event.attempt_index = repair_attempt_index++;
+        attempt_event.seed_robot_i = conflict.seed_robot_i;
+        attempt_event.seed_robot_j = conflict.seed_robot_j;
+        attempt_event.conflict_timestep = conflict.conflict_timestep;
+        attempt_event.robots = involved_robots;
+        attempt_event.phase = current_attempt_phase;
+        attempt_event.expansion_index = current_expansion_index;
+        attempt_event.window_start_t = start_t;
+        attempt_event.window_end_t = end_t;
+        attempt_event.max_t = max_t;
+        attempt_event.effective_global =
+            start_t == 0 && static_cast<std::size_t>(std::max(0, end_t)) >=
+                                max_t;
+        repair_attempt_events_.push_back(std::move(attempt_event));
+        auto &current_event = repair_attempt_events_.back();
+
         const double elapsed_s = std::chrono::duration<double>(
                                        std::chrono::steady_clock::now() - solve_start)
                                        .count();
         const double time_remaining = global_time_limit - elapsed_s;
-        if (isCancelled())
+        if (isCancelled()) {
+            current_event.outcome = "cancelled";
             return false;
-        if (time_remaining <= 0.0)
+        }
+        if (time_remaining <= 0.0) {
+            current_event.outcome = "budget_exhausted";
             return false;
+        }
 
         // Build local subproblem
         auto sub_problem = std::make_shared<MultiRobotProblem>(
@@ -608,10 +918,26 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
             cc_sub.isValidComposite(sub_ptrs, joint_goal);
         const bool local_endpoints_valid =
             start_composite_ok && goal_composite_ok;
+        current_event.validity_checked = true;
+        current_event.start_valid = start_composite_ok;
+        current_event.goal_valid = goal_composite_ok;
+        current_event.endpoints_valid = local_endpoints_valid;
+        if (local_endpoints_valid &&
+            !expansion_schedule_state.initial_valid_window_established) {
+            establishMainWindowGeometry(
+                start_t, end_t, expansion_schedule_state);
+        }
+        if (expansion_schedule_state.initial_valid_window_established) {
+            current_event.main_window_center_twice =
+                expansion_schedule_state.main_window_center_twice;
+            current_event.main_base_half_width_twice =
+                expansion_schedule_state.main_base_half_width_twice;
+        }
 
         const bool temporal_full_window =
             (start_t == 0 && max_t > 0 &&
              static_cast<size_t>(end_t) >= max_t - 1);
+        current_event.temporal_full_window = temporal_full_window;
 
         if (use_cspace_bounds_) {
             size_t li = 0;
@@ -731,6 +1057,8 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
             }
             local_makespan_bound_timesteps = raw_local_bound;
         }
+        current_event.bounded_epsilon_skipped =
+            skip_bounded_local_attempt_for_epsilon;
 
         const auto remainingWall = [&]() {
             const double elapsed = std::chrono::duration<double>(
@@ -785,6 +1113,8 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                 planner->setCancellationCallback(cancel_requested);
                 double strrt_wall = remainingWall();
                 if (strrt_wall > 0.0) {
+                    current_event.prioritized_invoked = true;
+                    current_event.solver_invoked = true;
                     auto status = planner->solve(strrt_wall);
                     if (status == ompl::base::PlannerStatus::EXACT_SOLUTION) {
                         auto local_paths = planner->getSolutionPaths();
@@ -799,29 +1129,42 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                             *window_start_t_out = start_t;
                         if (window_end_t_out)
                             *window_end_t_out = end_t;
+                        current_event.resolved = true;
+                        current_event.solved_by = "prioritized_strrt";
+                        current_event.outcome = "solved";
                         return true;
                     }
-                    if (isCancelled())
+                    if (isCancelled()) {
+                        current_event.outcome = "cancelled";
                         return false;
+                    }
                 }
             }
 
             // Layer 2: Composite RRT-C / bounded Composite AO-RRT-C
             if (use_composite) {
                 const double composite_wall = remainingWall();
-                if (isCancelled())
+                if (isCancelled()) {
+                    current_event.outcome = "cancelled";
                     return false;
+                }
                 if (composite_wall <= 0.0) {
                     // No wall time left for this local attempt; treat as failure.
                 } else {
+                    current_event.composite_invoked = true;
+                    current_event.solver_invoked = true;
                     ompl::base::PlannerStatus status{
                         ompl::base::PlannerStatus::TIMEOUT};
                     std::vector<Path> local_paths;
+                    const auto &conflict_simplification_options =
+                        conflict_simplification_options_.value_or(
+                            simplification_options_);
                     if (global_makespan_bound_timesteps_) {
                         aorrtc::SolveOptions options;
                         options.use_makespan_metric = true;
                         options.simplify_solution = simplify_conflict_solutions_;
-                        options.simplification_options = simplification_options_;
+                        options.simplification_options =
+                            conflict_simplification_options;
                         options.cost_bound_timesteps =
                             local_makespan_bound_timesteps;
                         if (local_composite_rrt_max_samples_ > 0) {
@@ -843,6 +1186,10 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                         planner->setProblem(sub_problem);
                         planner->setPlanningSeed(planning_seed_);
                         planner->setSimplifySolution(simplify_conflict_solutions_);
+                        planner->setPathSimplificationOptions(
+                            conflict_simplification_options);
+                        if (local_composite_rrt_range_)
+                            planner->setRange(*local_composite_rrt_range_);
                         planner->setUseMakespanMetric(
                             local_composite_rrt_use_makespan_metric_);
                         planner->setCancellationCallback(cancel_requested);
@@ -877,10 +1224,15 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                             *window_start_t_out = start_t;
                         if (window_end_t_out)
                             *window_end_t_out = end_t;
+                        current_event.resolved = true;
+                        current_event.solved_by = "composite_rrt";
+                        current_event.outcome = "solved";
                         return true;
                     }
-                    if (isCancelled())
+                    if (isCancelled()) {
+                        current_event.outcome = "cancelled";
                         return false;
+                    }
                 }
             }
         } // local_endpoints_valid
@@ -891,27 +1243,71 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                                                .count();
         const double time_remaining_after_local =
             global_time_limit - elapsed_after_local;
-        if (isCancelled())
+        if (isCancelled()) {
+            current_event.outcome = "cancelled";
             return false;
-        if (time_remaining_after_local <= 0.0)
+        }
+        if (time_remaining_after_local <= 0.0) {
+            current_event.outcome = "budget_exhausted";
             return false;
+        }
 
-        // Expand subproblem (match mr-vamp: fixed expansion_step) until full window
+        // Expand the temporal subproblem according to the configured schedule.
         if (start_t == 0 && static_cast<size_t>(end_t) >= max_t) {
+            current_event.outcome = "global_window_failed";
             recordWindow();
             return false;
         }
         const int prev_start = start_t;
         const size_t prev_end = static_cast<size_t>(end_t);
-        start_t = std::max(0, start_t - expansion_step_);
-        end_t = static_cast<int>(
-            std::min(static_cast<size_t>(end_t) + expansion_step_, max_t));
-        if (!(start_t == prev_start && static_cast<size_t>(end_t) == prev_end))
+        const std::size_t initial_valid_index_before =
+            expansion_schedule_state.initial_valid_expansion_index;
+        const std::size_t main_index_before =
+            expansion_schedule_state.main_expansion_index;
+        std::tie(start_t, end_t) =
+            nextExpansionWindowAfterAttempt(
+                start_t, end_t, max_t, start_composite_ok,
+                goal_composite_ok,
+                expansion_schedule_state);
+        if (expansion_schedule_state
+                .last_expansion_used_initial_valid_schedule) {
+            current_attempt_phase = RepairAttemptPhase::InitialValid;
+            current_expansion_index = initial_valid_index_before;
+        } else {
+            current_attempt_phase = RepairAttemptPhase::Main;
+            current_expansion_index = main_index_before;
+        }
+        if (!(start_t == prev_start &&
+              static_cast<size_t>(end_t) == prev_end)) {
             ++num_temporal_expansions_;
-        if (start_t == prev_start && static_cast<size_t>(end_t) == prev_end) {
+            if (expansion_schedule_state
+                    .last_expansion_used_initial_valid_schedule) {
+                ++num_initial_valid_temporal_expansions_;
+            } else {
+                ++num_main_temporal_expansions_;
+            }
+        }
+        const bool repeated_custom_window =
+            start_t == prev_start &&
+            static_cast<size_t>(end_t) == prev_end &&
+            ((expansion_schedule_state
+                      .last_expansion_used_initial_valid_schedule &&
+              initialValidWindowExpansionPolicy() ==
+                  ExpansionPolicy::CustomMultiplied &&
+              initial_valid_index_before <
+                  initialValidWindowExpansionMultipliers().size()) ||
+             (!expansion_schedule_state
+                       .last_expansion_used_initial_valid_schedule &&
+              expansion_policy_ == ExpansionPolicy::CustomMultiplied &&
+              main_index_before <
+                  custom_expansion_multipliers_.size()));
+        if (start_t == prev_start && static_cast<size_t>(end_t) == prev_end &&
+            !repeated_custom_window) {
+            current_event.outcome = "expansion_exhausted";
             recordWindow();
             return false;
         }
+        current_event.outcome = "expanded";
     }
 }
 
@@ -1090,6 +1486,9 @@ ARC::ArcPlannerStatsSummary ARC::currentArcPlannerStatsSummary() const {
     summary.num_conflicts = num_conflicts_;
     summary.subproblem_attempts = num_subproblem_attempts_;
     summary.temporal_expansions = num_temporal_expansions_;
+    summary.initial_valid_temporal_expansions =
+        num_initial_valid_temporal_expansions_;
+    summary.main_temporal_expansions = num_main_temporal_expansions_;
     summary.initial_solution_times_seconds_wall_clock =
         initial_solution_times_seconds_wall_clock_;
     summary.initial_solution_times_seconds_cpu =
@@ -1127,6 +1526,10 @@ nlohmann::json ARC::plannerStatsJsonFromSummary(
     stats["num_conflicts"] = summary.num_conflicts;
     stats["subproblem_attempts"] = summary.subproblem_attempts;
     stats["temporal_expansions"] = summary.temporal_expansions;
+    stats["initial_valid_temporal_expansions"] =
+        summary.initial_valid_temporal_expansions;
+    stats["main_temporal_expansions"] =
+        summary.main_temporal_expansions;
     stats["initial_solution_times_seconds_wall_clock"] =
         summary.initial_solution_times_seconds_wall_clock;
     stats["initial_solution_times_seconds_cpu"] =
@@ -1163,6 +1566,10 @@ nlohmann::json ARC::plannerStatsJsonFromSummary(
     // Preserve legacy ARC field names for existing tooling.
     stats["num_subproblem_attempts"] = summary.subproblem_attempts;
     stats["num_temporal_expansions"] = summary.temporal_expansions;
+    stats["num_initial_valid_temporal_expansions"] =
+        summary.initial_valid_temporal_expansions;
+    stats["num_main_temporal_expansions"] =
+        summary.main_temporal_expansions;
     if (conflict_resolution_times_seconds) {
         stats["conflict_resolution_times_seconds"] =
             *conflict_resolution_times_seconds;
@@ -1204,7 +1611,7 @@ double ARC::elapsedProcessTreeCpuSeconds(
     return elapsed < 0.0 ? 0.0 : elapsed;
 }
 
-nlohmann::json ARC::temporaryConflictFindTimingJson(
+nlohmann::json ARC::conflictFindTimingJson(
     const std::vector<double> &main_process_wall_seconds,
     const std::vector<double> &process_tree_cpu_seconds,
     const std::vector<double> &build_worker_wall_seconds,
@@ -1249,6 +1656,257 @@ nlohmann::json ARC::temporaryConflictFindTimingJson(
          sumSeconds(critical_worker_total_wall_seconds)},
         {"critical_worker_total_wall_seconds_by_round",
          critical_worker_total_wall_seconds},
+    };
+}
+
+nlohmann::json ARC::repairAttemptEventsJson() const {
+    const auto phaseName = [](RepairAttemptPhase phase) {
+        switch (phase) {
+        case RepairAttemptPhase::InitialWindow:
+            return "initial_window";
+        case RepairAttemptPhase::InitialValid:
+            return "initial_valid";
+        case RepairAttemptPhase::Main:
+            return "main";
+        }
+        return "unknown";
+    };
+
+    nlohmann::json events = nlohmann::json::array();
+    for (const auto &event : repair_attempt_events_) {
+        events.push_back({
+            {"repair_id", event.repair_id},
+            {"attempt_index", event.attempt_index},
+            {"seed_robot_i", event.seed_robot_i},
+            {"seed_robot_j", event.seed_robot_j},
+            {"conflict_timestep", event.conflict_timestep},
+            {"robots", event.robots},
+            {"phase", phaseName(event.phase)},
+            {"expansion_index",
+             event.expansion_index
+                 ? nlohmann::json(*event.expansion_index)
+                 : nlohmann::json(nullptr)},
+            {"window_start_t", event.window_start_t},
+            {"window_end_t", event.window_end_t},
+            {"max_t", event.max_t},
+            {"effective_global", event.effective_global},
+            {"temporal_full_window", event.temporal_full_window},
+            {"validity_checked", event.validity_checked},
+            {"start_valid", event.start_valid},
+            {"goal_valid", event.goal_valid},
+            {"endpoints_valid", event.endpoints_valid},
+            {"bounded_epsilon_skipped", event.bounded_epsilon_skipped},
+            {"prioritized_invoked", event.prioritized_invoked},
+            {"composite_invoked", event.composite_invoked},
+            {"solver_invoked", event.solver_invoked},
+            {"resolved", event.resolved},
+            {"main_window_center_twice",
+             event.main_window_center_twice
+                 ? nlohmann::json(*event.main_window_center_twice)
+                 : nlohmann::json(nullptr)},
+            {"main_base_half_width_twice",
+             event.main_base_half_width_twice
+                 ? nlohmann::json(*event.main_base_half_width_twice)
+                 : nlohmann::json(nullptr)},
+            {"solved_by",
+             event.solved_by.empty() ? nlohmann::json(nullptr)
+                                     : nlohmann::json(event.solved_by)},
+            {"outcome", event.outcome},
+        });
+    }
+    return events;
+}
+
+nlohmann::json ARC::conflictResolutionEventsJson() const {
+    struct ResolutionEvent {
+        std::uint64_t repair_id = 0;
+        std::uint64_t attempt_count = 0;
+        std::uint64_t solver_calls = 0;
+        std::uint64_t composite_solver_calls = 0;
+        std::uint64_t prioritized_solver_calls = 0;
+        bool used_initial_valid_expansion = false;
+        bool used_main_expansion = false;
+        bool reached_global_window = false;
+        bool resolved = false;
+        bool resolved_by_composite = false;
+    };
+
+    std::vector<ResolutionEvent> resolutions(
+        conflict_resolution_times_seconds_.size());
+    for (std::size_t repair_id = 0; repair_id < resolutions.size();
+         ++repair_id) {
+        resolutions[repair_id].repair_id = repair_id;
+    }
+
+    for (const auto &attempt : repair_attempt_events_) {
+        if (attempt.repair_id >= resolutions.size())
+            continue;
+        auto &resolution =
+            resolutions[static_cast<std::size_t>(attempt.repair_id)];
+        ++resolution.attempt_count;
+        if (attempt.solver_invoked)
+            ++resolution.solver_calls;
+        if (attempt.composite_invoked)
+            ++resolution.composite_solver_calls;
+        if (attempt.prioritized_invoked)
+            ++resolution.prioritized_solver_calls;
+        resolution.used_initial_valid_expansion =
+            resolution.used_initial_valid_expansion ||
+            attempt.phase == RepairAttemptPhase::InitialValid;
+        resolution.used_main_expansion =
+            resolution.used_main_expansion ||
+            attempt.phase == RepairAttemptPhase::Main;
+        resolution.reached_global_window =
+            resolution.reached_global_window || attempt.effective_global;
+        resolution.resolved = resolution.resolved || attempt.resolved;
+        resolution.resolved_by_composite =
+            resolution.resolved_by_composite ||
+            (attempt.resolved && attempt.composite_invoked);
+    }
+
+    nlohmann::json events = nlohmann::json::array();
+    for (std::size_t repair_id = 0; repair_id < resolutions.size();
+         ++repair_id) {
+        const auto &resolution = resolutions[repair_id];
+        const double cpu_seconds =
+            repair_id < conflict_resolution_times_cpu_seconds_.size()
+                ? conflict_resolution_times_cpu_seconds_[repair_id]
+                : 0.0;
+        events.push_back({
+            {"repair_id", resolution.repair_id},
+            {"wall_seconds",
+             conflict_resolution_times_seconds_[repair_id]},
+            {"cpu_seconds", cpu_seconds},
+            {"attempt_count", resolution.attempt_count},
+            {"solver_calls", resolution.solver_calls},
+            {"composite_solver_calls",
+             resolution.composite_solver_calls},
+            {"prioritized_solver_calls",
+             resolution.prioritized_solver_calls},
+            {"used_initial_valid_expansion",
+             resolution.used_initial_valid_expansion},
+            {"used_main_expansion", resolution.used_main_expansion},
+            {"reached_global_window",
+             resolution.reached_global_window},
+            {"resolved", resolution.resolved},
+            {"resolved_by_composite",
+             resolution.resolved_by_composite},
+            {"solved_on_first_composite_call",
+             resolution.resolved_by_composite &&
+                 resolution.composite_solver_calls == 1},
+            {"solved_without_main_expansion",
+             resolution.resolved &&
+                 !resolution.used_main_expansion},
+        });
+    }
+    return events;
+}
+
+nlohmann::json ARC::conflictSolveCountsByExpansionStageJson() const {
+    struct StageCounts {
+        std::uint64_t attempts = 0;
+        std::uint64_t validity_checked_attempts = 0;
+        std::uint64_t endpoint_valid_attempts = 0;
+        std::uint64_t effective_global_attempts = 0;
+        std::uint64_t temporal_full_window_attempts = 0;
+        std::uint64_t solver_attempts = 0;
+        std::uint64_t solver_invocations = 0;
+        std::uint64_t resolved_conflicts = 0;
+    };
+
+    const auto addEvent = [](StageCounts &counts,
+                             const RepairAttemptEvent &event) {
+        ++counts.attempts;
+        if (event.validity_checked)
+            ++counts.validity_checked_attempts;
+        if (event.validity_checked && event.endpoints_valid)
+            ++counts.endpoint_valid_attempts;
+        if (event.effective_global)
+            ++counts.effective_global_attempts;
+        if (event.temporal_full_window)
+            ++counts.temporal_full_window_attempts;
+        if (event.solver_invoked)
+            ++counts.solver_attempts;
+        if (event.prioritized_invoked)
+            ++counts.solver_invocations;
+        if (event.composite_invoked)
+            ++counts.solver_invocations;
+        if (event.resolved)
+            ++counts.resolved_conflicts;
+    };
+    const auto countsJson = [](const StageCounts &counts) {
+        return nlohmann::json{
+            {"attempts", counts.attempts},
+            {"validity_checked_attempts",
+             counts.validity_checked_attempts},
+            {"endpoint_valid_attempts", counts.endpoint_valid_attempts},
+            {"effective_global_attempts",
+             counts.effective_global_attempts},
+            {"temporal_full_window_attempts",
+             counts.temporal_full_window_attempts},
+            {"solver_attempts", counts.solver_attempts},
+            {"solver_invocations", counts.solver_invocations},
+            {"resolved_conflicts", counts.resolved_conflicts},
+        };
+    };
+
+    StageCounts initial_window_counts;
+    StageCounts initial_valid_counts;
+    StageCounts global_counts;
+    StageCounts unindexed_main_counts;
+    StageCounts main_total_counts;
+    StageCounts total_counts;
+    std::map<std::size_t, StageCounts> index_counts;
+    if (expansion_policy_ == ExpansionPolicy::CustomMultiplied) {
+        for (std::size_t index = 0;
+             index < custom_expansion_multipliers_.size(); ++index) {
+            index_counts[index];
+        }
+    }
+
+    for (const auto &event : repair_attempt_events_) {
+        addEvent(total_counts, event);
+        switch (event.phase) {
+        case RepairAttemptPhase::InitialWindow:
+            addEvent(initial_window_counts, event);
+            break;
+        case RepairAttemptPhase::InitialValid:
+            addEvent(initial_valid_counts, event);
+            break;
+        case RepairAttemptPhase::Main:
+            addEvent(main_total_counts, event);
+            if (event.effective_global) {
+                addEvent(global_counts, event);
+            } else if (event.expansion_index) {
+                addEvent(index_counts[*event.expansion_index], event);
+            } else {
+                addEvent(unindexed_main_counts, event);
+            }
+            break;
+        }
+    }
+
+    nlohmann::json indices = nlohmann::json::array();
+    for (const auto &[index, counts] : index_counts) {
+        auto entry = countsJson(counts);
+        entry["index"] = index;
+        entry["multiplier"] =
+            expansion_policy_ == ExpansionPolicy::CustomMultiplied &&
+                    index < custom_expansion_multipliers_.size()
+                ? nlohmann::json(custom_expansion_multipliers_[index])
+                : nlohmann::json(nullptr);
+        indices.push_back(std::move(entry));
+    }
+
+    return {
+        {"initial_window", countsJson(initial_window_counts)},
+        {"initial_valid", countsJson(initial_valid_counts)},
+        {"indices", std::move(indices)},
+        {"global", countsJson(global_counts)},
+        {"unindexed_main", countsJson(unindexed_main_counts)},
+        {"main_total", countsJson(main_total_counts)},
+        {"total", countsJson(total_counts)},
+        {"global_bucket_rule", "phase_main_and_effective_global"},
     };
 }
 
@@ -1361,20 +2019,19 @@ ompl::base::PlannerStatus ARC::solve(double timeLimit) {
             currentArcPlannerStatsSummary(),
             &conflict_resolution_times_seconds_,
             &conflict_detection_times_seconds_);
-        // TEMP(ablation): keep the fine-grained conflict-find timing isolated
-        // in one nested block so we can delete it cleanly after repro work.
-        stats["temporary_conflict_find_timing"] =
-            temporaryConflictFindTimingJson(
-                temporary_conflict_find_main_process_wall_seconds_,
-                temporary_conflict_find_process_tree_cpu_seconds_,
-                temporary_conflict_find_build_worker_wall_seconds_,
-                temporary_conflict_find_build_worker_cpu_seconds_,
-                temporary_conflict_find_collision_worker_wall_seconds_,
-                temporary_conflict_find_collision_worker_cpu_seconds_,
-                temporary_conflict_find_critical_worker_index_,
-                temporary_conflict_find_critical_worker_build_wall_seconds_,
-                temporary_conflict_find_critical_worker_collision_wall_seconds_,
-                temporary_conflict_find_critical_worker_total_wall_seconds_);
+        // Keep the detailed timing in a nested block so consumers can opt in.
+        stats["conflict_find_timing"] =
+            conflictFindTimingJson(
+                conflict_find_main_process_wall_seconds_,
+                conflict_find_process_tree_cpu_seconds_,
+                conflict_find_build_worker_wall_seconds_,
+                conflict_find_build_worker_cpu_seconds_,
+                conflict_find_collision_worker_wall_seconds_,
+                conflict_find_collision_worker_cpu_seconds_,
+                conflict_find_critical_worker_index_,
+                conflict_find_critical_worker_build_wall_seconds_,
+                conflict_find_critical_worker_collision_wall_seconds_,
+                conflict_find_critical_worker_total_wall_seconds_);
         stats["solution_events"] = nlohmann::json::array();
         if (exact_solution && makespanTimesteps()) {
             stats["solution_events"].push_back({
@@ -1388,6 +2045,9 @@ ompl::base::PlannerStatus ARC::solve(double timeLimit) {
                 {"kind", "first_solution"},
             });
         }
+        const auto conflict_simplification_options =
+            conflict_simplification_options_.value_or(
+                simplification_options_);
         stats["path_simplification"] = {
             {"initial_enabled", simplify_initial_solutions_},
             {"conflict_enabled", simplify_conflict_solutions_},
@@ -1395,7 +2055,55 @@ ompl::base::PlannerStatus ARC::solve(double timeLimit) {
             {"max_empty_steps", simplification_options_.max_empty_steps},
             {"max_smooth_steps", simplification_options_.max_smooth_steps},
             {"max_passes", simplification_options_.max_passes},
+            {"initial",
+             {
+                 {"max_shortcut_steps",
+                  simplification_options_.max_shortcut_steps},
+                 {"max_empty_steps",
+                  simplification_options_.max_empty_steps},
+                 {"max_smooth_steps",
+                  simplification_options_.max_smooth_steps},
+                 {"max_passes", simplification_options_.max_passes},
+             }},
+            {"conflict",
+             {
+                 {"inherits_initial_options",
+                  !conflict_simplification_options_.has_value()},
+                 {"max_shortcut_steps",
+                  conflict_simplification_options.max_shortcut_steps},
+                 {"max_empty_steps",
+                  conflict_simplification_options.max_empty_steps},
+                 {"max_smooth_steps",
+                  conflict_simplification_options.max_smooth_steps},
+                 {"max_passes",
+                  conflict_simplification_options.max_passes},
+             }},
         };
+        stats["expansion_policy"] =
+            arcExpansionPolicyStr(expansion_policy_);
+        stats["initial_window"] = initial_window_;
+        stats["expansion_step"] = expansion_step_;
+        stats["custom_expansion_multipliers"] =
+            custom_expansion_multipliers_;
+        stats["initial_valid_expansion_policy"] =
+            arcExpansionPolicyStr(initialValidWindowExpansionPolicy());
+        stats["initial_valid_expansion_step"] =
+            initialValidWindowExpansionStep();
+        stats["initial_valid_custom_expansion_multipliers"] =
+            initialValidWindowExpansionMultipliers();
+        stats["initial_valid_expansion_symmetric"] =
+            initialValidWindowExpansionSymmetric();
+        stats["initial_valid_expansion_inherits_main"] = {
+            {"policy", initialValidWindowExpansionPolicyInheritsMain()},
+            {"step", initialValidWindowExpansionStepInheritsMain()},
+            {"multipliers",
+             initialValidWindowExpansionMultipliersInheritMain()},
+        };
+        stats["repair_attempt_events"] = repairAttemptEventsJson();
+        stats["conflict_resolution_events"] =
+            conflictResolutionEventsJson();
+        stats["conflict_solve_counts_by_expansion_stage"] =
+            conflictSolveCountsByExpansionStageJson();
         stats["num_solution_events"] = stats["solution_events"].size();
         setPlannerStatsJson(std::move(stats));
     };
@@ -1427,9 +2135,9 @@ ompl::base::PlannerStatus ARC::solve(double timeLimit) {
         const double conflict_detection_cpu_start = processCpuSeconds();
         const auto conflict_detection_tree_cpu_start =
             processTreeCpuUsageSnapshot();
-        TemporaryConflictFindInstrumentation temporary_conflict_find_timing;
-        options.temporary_conflict_find_instrumentation =
-            &temporary_conflict_find_timing;
+        ConflictFindTimingInstrumentation conflict_find_timing;
+        options.conflict_find_timing_instrumentation =
+            &conflict_find_timing;
         const auto conflicts = conflict_checker.findConflicts(
             solution_paths_, ptrs, options, 0, 1, true,
             [this](const Conflict &conflict) {
@@ -1445,27 +2153,27 @@ ompl::base::PlannerStatus ARC::solve(double timeLimit) {
             conflict_detection_wall_seconds);
         conflict_detection_times_cpu_seconds_.push_back(
             elapsedProcessCpuSeconds(conflict_detection_cpu_start));
-        temporary_conflict_find_main_process_wall_seconds_.push_back(
+        conflict_find_main_process_wall_seconds_.push_back(
             conflict_detection_wall_seconds);
-        temporary_conflict_find_process_tree_cpu_seconds_.push_back(
+        conflict_find_process_tree_cpu_seconds_.push_back(
             elapsedProcessTreeCpuSeconds(conflict_detection_tree_cpu_start,
                                          processTreeCpuUsageSnapshot()));
-        temporary_conflict_find_build_worker_wall_seconds_.push_back(
-            temporary_conflict_find_timing.build_worker_wall_seconds);
-        temporary_conflict_find_build_worker_cpu_seconds_.push_back(
-            temporary_conflict_find_timing.build_worker_cpu_seconds);
-        temporary_conflict_find_collision_worker_wall_seconds_.push_back(
-            temporary_conflict_find_timing.collision_worker_wall_seconds);
-        temporary_conflict_find_collision_worker_cpu_seconds_.push_back(
-            temporary_conflict_find_timing.collision_worker_cpu_seconds);
-        temporary_conflict_find_critical_worker_index_.push_back(
-            temporary_conflict_find_timing.criticalWorkerIndex());
-        temporary_conflict_find_critical_worker_build_wall_seconds_.push_back(
-            temporary_conflict_find_timing.criticalWorkerBuildWallSeconds());
-        temporary_conflict_find_critical_worker_collision_wall_seconds_.push_back(
-            temporary_conflict_find_timing.criticalWorkerCollisionWallSeconds());
-        temporary_conflict_find_critical_worker_total_wall_seconds_.push_back(
-            temporary_conflict_find_timing.criticalWorkerTotalWallSeconds());
+        conflict_find_build_worker_wall_seconds_.push_back(
+            conflict_find_timing.build_worker_wall_seconds);
+        conflict_find_build_worker_cpu_seconds_.push_back(
+            conflict_find_timing.build_worker_cpu_seconds);
+        conflict_find_collision_worker_wall_seconds_.push_back(
+            conflict_find_timing.collision_worker_wall_seconds);
+        conflict_find_collision_worker_cpu_seconds_.push_back(
+            conflict_find_timing.collision_worker_cpu_seconds);
+        conflict_find_critical_worker_index_.push_back(
+            conflict_find_timing.criticalWorkerIndex());
+        conflict_find_critical_worker_build_wall_seconds_.push_back(
+            conflict_find_timing.criticalWorkerBuildWallSeconds());
+        conflict_find_critical_worker_collision_wall_seconds_.push_back(
+            conflict_find_timing.criticalWorkerCollisionWallSeconds());
+        conflict_find_critical_worker_total_wall_seconds_.push_back(
+            conflict_find_timing.criticalWorkerTotalWallSeconds());
         elapsed = std::chrono::steady_clock::now() - start_time;
         elapsed_s = std::chrono::duration<double>(elapsed).count();
         if (elapsed_s >= timeLimit) {

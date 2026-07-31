@@ -1,0 +1,498 @@
+{
+  "schema": "comotion.parameter_sweep.v1",
+  "description": "Small 8-seed planner parameter sweep for mobile 2D parallel n=8, Panda cage n=4, and heterogeneous corridor p4/s8.",
+  "defaults": {
+    "collision_backend": "vamp",
+    "resolution": 128,
+    "trials_per_param_set": 8,
+    "methods": [
+      "composite",
+      "prioritized",
+      "drrt",
+      "stcbs",
+      "arc"
+    ],
+    "base_params": {
+      "strrt_initial_batch_size": 4096,
+      "strrt_time_bound_factor_increase": 2.0,
+      "strrt_return_first_solution": true,
+      "strrt_rewiring": "off",
+      "drrt_tensor_search": "drrt",
+      "composite_rrt_simplify_solution": false,
+      "composite_rrt_use_makespan_metric": true,
+      "composite_aorrtc_max_internal_samples": 10000,
+      "composite_aorrtc_max_internal_vertices": 10000,
+      "cooperative_rrt_worker_threads": 2,
+      "arc_local_composite_use_makespan_metric": true,
+      "arc_simplify_initial_solutions": true,
+      "arc_simplify_conflict_solutions": false,
+      "arc_local_solvers": "composite",
+      "ao_arc_local_bound_epsilon_timesteps": 1,
+      "or_parallel_worker_processes": 1,
+      "parallel_arc_worker_processes": 2,
+      "parallel_arc_parallel_initial_plans": true,
+      "parallel_arc_initial_solution_or": false,
+      "parallel_arc_repair_duplicate_attempts": true,
+      "parallel_arc_strategy": "synchronous",
+      "parallel_arc_conflict_strategy": "greedy",
+      "parallel_arc_conflict_find_mode": "segment_parallel",
+      "stcbs_max_ct_nodes": 5000
+    }
+  },
+  "apps": {
+    "mobile_parallel_n8": {
+      "title": "Flying spheres, mobile parallel, 8 robots",
+      "executable": "mobile_robot_2d_crossing",
+      "args": [
+        "--scenario",
+        "parallel",
+        "--num-robots",
+        "8"
+      ],
+      "time_limit": 100.0,
+      "base_params": {
+        "strrt_initial_time_factor": 2.0,
+        "drrt_roadmap_size": 30,
+        "drrt_iterations_per_batch": 8,
+        "drrt_cost_metric": "makespan",
+        "arc_initial_window": 200,
+        "arc_expansion_step": 200,
+        "arc_local_composite_max_samples": 5000,
+        "arc_local_prioritized_max_iterations": 5,
+        "parallel_arc_conflict_find_horizon": 400,
+        "stcbs_max_samples": 25000
+      },
+      "param_grid": {
+        "composite": [
+          {
+            "name": "makespan_metric",
+            "params": {}
+          },
+          {
+            "name": "default_metric",
+            "params": {
+              "composite_rrt_use_makespan_metric": false
+            }
+          },
+          {
+            "name": "makespan_metric_simplify",
+            "params": {
+              "composite_rrt_simplify_solution": true
+            }
+          }
+        ],
+        "prioritized": [
+          {
+            "name": "default",
+            "params": {}
+          },
+          {
+            "name": "smaller_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 2048,
+              "strrt_initial_time_factor": 1.5
+            }
+          },
+          {
+            "name": "tiny_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 1024,
+              "strrt_initial_time_factor": 1.0
+            }
+          },
+          {
+            "name": "larger_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 8192,
+              "strrt_initial_time_factor": 2.0
+            }
+          }
+        ],
+        "drrt": [
+          {
+            "name": "default_makespan",
+            "params": {}
+          },
+          {
+            "name": "smaller_roadmap",
+            "params": {
+              "drrt_roadmap_size": 15,
+              "drrt_iterations_per_batch": 4
+            }
+          },
+          {
+            "name": "larger_roadmap",
+            "params": {
+              "drrt_roadmap_size": 60,
+              "drrt_iterations_per_batch": 8
+            }
+          },
+          {
+            "name": "composite_l2_metric",
+            "params": {
+              "drrt_cost_metric": "composite_l2"
+            }
+          }
+        ],
+        "stcbs": [
+          {
+            "name": "samples_10k",
+            "params": {
+              "stcbs_max_samples": 10000
+            }
+          },
+          {
+            "name": "samples_25k",
+            "params": {
+              "stcbs_max_samples": 25000
+            }
+          },
+          {
+            "name": "samples_75k",
+            "params": {
+              "stcbs_max_samples": 75000
+            }
+          },
+          {
+            "name": "samples_10k_ct_2500",
+            "params": {
+              "stcbs_max_ct_nodes": 2500,
+              "stcbs_max_samples": 10000
+            }
+          }
+        ],
+        "arc": [
+          {
+            "name": "default200_5k",
+            "params": {}
+          },
+          {
+            "name": "smaller100_2500",
+            "params": {
+              "arc_initial_window": 100,
+              "arc_expansion_step": 100,
+              "arc_local_composite_max_samples": 2500
+            }
+          },
+          {
+            "name": "tiny50_2500",
+            "params": {
+              "arc_initial_window": 50,
+              "arc_expansion_step": 50,
+              "arc_local_composite_max_samples": 2500
+            }
+          },
+          {
+            "name": "default200_10k",
+            "params": {
+              "arc_local_composite_max_samples": 10000
+            }
+          }
+        ]
+      }
+    },
+    "panda_cage_n4": {
+      "title": "Panda cage, 4 robots",
+      "executable": "panda_cage",
+      "args": [
+        "--num-robots",
+        "4",
+        "--task-index",
+        "0"
+      ],
+      "time_limit": 100.0,
+      "base_params": {
+        "strrt_initial_time_factor": 4.0,
+        "drrt_roadmap_size": 300,
+        "drrt_iterations_per_batch": 32,
+        "drrt_cost_metric": "makespan",
+        "arc_initial_window": 50,
+        "arc_expansion_step": 50,
+        "arc_local_composite_max_samples": 250000,
+        "arc_local_prioritized_max_iterations": 10,
+        "parallel_arc_conflict_find_horizon": 200,
+        "stcbs_max_samples": 75000
+      },
+      "param_grid": {
+        "composite": [
+          {
+            "name": "makespan_metric",
+            "params": {}
+          },
+          {
+            "name": "default_metric",
+            "params": {
+              "composite_rrt_use_makespan_metric": false
+            }
+          },
+          {
+            "name": "makespan_metric_simplify",
+            "params": {
+              "composite_rrt_simplify_solution": true
+            }
+          }
+        ],
+        "prioritized": [
+          {
+            "name": "default",
+            "params": {}
+          },
+          {
+            "name": "smaller_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 2048,
+              "strrt_initial_time_factor": 2.0
+            }
+          },
+          {
+            "name": "tiny_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 1024,
+              "strrt_initial_time_factor": 1.0
+            }
+          },
+          {
+            "name": "larger_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 8192,
+              "strrt_initial_time_factor": 4.0
+            }
+          }
+        ],
+        "drrt": [
+          {
+            "name": "default_makespan",
+            "params": {}
+          },
+          {
+            "name": "smaller_roadmap",
+            "params": {
+              "drrt_roadmap_size": 150,
+              "drrt_iterations_per_batch": 16
+            }
+          },
+          {
+            "name": "larger_roadmap",
+            "params": {
+              "drrt_roadmap_size": 600,
+              "drrt_iterations_per_batch": 32
+            }
+          },
+          {
+            "name": "composite_l2_metric",
+            "params": {
+              "drrt_cost_metric": "composite_l2"
+            }
+          }
+        ],
+        "stcbs": [
+          {
+            "name": "samples_25k",
+            "params": {
+              "stcbs_max_samples": 25000
+            }
+          },
+          {
+            "name": "samples_75k",
+            "params": {
+              "stcbs_max_samples": 75000
+            }
+          },
+          {
+            "name": "samples_150k",
+            "params": {
+              "stcbs_max_samples": 150000
+            }
+          },
+          {
+            "name": "samples_25k_ct_2500",
+            "params": {
+              "stcbs_max_ct_nodes": 2500,
+              "stcbs_max_samples": 25000
+            }
+          }
+        ],
+        "arc": [
+          {
+            "name": "tiny50_250k",
+            "params": {}
+          },
+          {
+            "name": "smaller100_250k",
+            "params": {
+              "arc_initial_window": 100,
+              "arc_expansion_step": 100
+            }
+          },
+          {
+            "name": "default200_250k",
+            "params": {
+              "arc_initial_window": 200,
+              "arc_expansion_step": 200
+            }
+          },
+          {
+            "name": "tiny50_500k",
+            "params": {
+              "arc_local_composite_max_samples": 500000
+            }
+          }
+        ]
+      }
+    },
+    "heterogeneous_corridor_p4_s8": {
+      "title": "Heterogeneous corridor, 4 Pandas + 8 flying spheres",
+      "executable": "heterogeneous_corridor",
+      "args": [
+        "--num-pandas",
+        "4",
+        "--num-spheres",
+        "8",
+        "--task-index",
+        "0"
+      ],
+      "time_limit": 100.0,
+      "base_params": {
+        "strrt_initial_time_factor": 4.0,
+        "drrt_roadmap_size": 200,
+        "drrt_iterations_per_batch": 8,
+        "drrt_cost_metric": "sum_of_costs",
+        "arc_initial_window": 200,
+        "arc_expansion_step": 200,
+        "arc_local_composite_max_samples": 500000,
+        "arc_local_prioritized_max_iterations": 5,
+        "parallel_arc_conflict_find_horizon": 400,
+        "stcbs_max_samples": 75000
+      },
+      "param_grid": {
+        "composite": [
+          {
+            "name": "makespan_metric",
+            "params": {}
+          },
+          {
+            "name": "default_metric",
+            "params": {
+              "composite_rrt_use_makespan_metric": false
+            }
+          },
+          {
+            "name": "makespan_metric_simplify",
+            "params": {
+              "composite_rrt_simplify_solution": true
+            }
+          }
+        ],
+        "prioritized": [
+          {
+            "name": "default",
+            "params": {}
+          },
+          {
+            "name": "smaller_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 2048,
+              "strrt_initial_time_factor": 2.0
+            }
+          },
+          {
+            "name": "tiny_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 1024,
+              "strrt_initial_time_factor": 1.0
+            }
+          },
+          {
+            "name": "larger_initial_batch",
+            "params": {
+              "strrt_initial_batch_size": 8192,
+              "strrt_initial_time_factor": 4.0
+            }
+          }
+        ],
+        "drrt": [
+          {
+            "name": "default_sum_of_costs",
+            "params": {}
+          },
+          {
+            "name": "smaller_roadmap",
+            "params": {
+              "drrt_roadmap_size": 100,
+              "drrt_iterations_per_batch": 4
+            }
+          },
+          {
+            "name": "larger_roadmap",
+            "params": {
+              "drrt_roadmap_size": 400,
+              "drrt_iterations_per_batch": 8
+            }
+          },
+          {
+            "name": "makespan_metric",
+            "params": {
+              "drrt_cost_metric": "makespan"
+            }
+          }
+        ],
+        "stcbs": [
+          {
+            "name": "samples_25k",
+            "params": {
+              "stcbs_max_samples": 25000
+            }
+          },
+          {
+            "name": "samples_75k",
+            "params": {
+              "stcbs_max_samples": 75000
+            }
+          },
+          {
+            "name": "samples_150k",
+            "params": {
+              "stcbs_max_samples": 150000
+            }
+          },
+          {
+            "name": "samples_25k_ct_2500",
+            "params": {
+              "stcbs_max_ct_nodes": 2500,
+              "stcbs_max_samples": 25000
+            }
+          }
+        ],
+        "arc": [
+          {
+            "name": "default200_500k",
+            "params": {}
+          },
+          {
+            "name": "smaller100_250k",
+            "params": {
+              "arc_initial_window": 100,
+              "arc_expansion_step": 100,
+              "arc_local_composite_max_samples": 250000
+            }
+          },
+          {
+            "name": "tiny50_250k",
+            "params": {
+              "arc_initial_window": 50,
+              "arc_expansion_step": 50,
+              "arc_local_composite_max_samples": 250000
+            }
+          },
+          {
+            "name": "smaller100_500k",
+            "params": {
+              "arc_initial_window": 100,
+              "arc_expansion_step": 100
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@
 
 #include "comotion/collision/ObstacleShapes.h"
 #include "comotion/collision/ValidationTypes.h"
+#include "comotion/collision/ValidationTrace.h"
 #include "comotion/planning/Path.h"
 #include "comotion/robot/RobotModel.h"
 
@@ -32,6 +33,12 @@ public:
     void setCylinderObstacles(const std::vector<ObstacleCylinder> &cylinders);
     void setVampValidationStrategy(const VampValidationStrategy &strategy);
     VampValidationStrategy vampValidationStrategy() const;
+    ValidationWorkStats lastValidationWorkStats() const;
+    static void resetValidationTimingStats();
+    static ValidationTimingStats validationTimingStats();
+    void setValidationTraceRecorder(
+        std::shared_ptr<ValidationTraceRecorder> recorder);
+    std::shared_ptr<ValidationTraceRecorder> validationTraceRecorder() const;
 
     bool isValidSingle(const RobotModel &robot,
                        const std::vector<double> &config) const;
@@ -117,6 +124,7 @@ private:
     Backend backend_;
     std::vector<ObstacleSphere> obstacles_;
     std::vector<ObstacleCylinder> cylinders_;
+    std::shared_ptr<ValidationTraceRecorder> trace_recorder_;
 };
 
 } // namespace comotion

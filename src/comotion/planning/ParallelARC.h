@@ -22,6 +22,7 @@ enum class ParallelArcConflictFindMode { Sequential, SegmentParallel };
 class ParallelARC : public ARC {
 public:
     ompl::base::PlannerStatus solve(double timeLimit) override;
+    bool runConflictDetectionAblation(double timeLimit);
     std::string name() const override { return "ParallelARC"; }
 
     void setWorkerProcesses(unsigned n) { worker_processes_ = n; }
@@ -44,6 +45,9 @@ public:
     void setConflictFindHorizon(std::size_t horizon) {
         conflict_find_horizon_ = horizon;
     }
+    void setConflictBatchMode(InterRobotConflictBatchMode mode) {
+        conflict_batch_mode_ = mode;
+    }
     void setRepairDuplicateAttempts(bool enabled) {
         repair_duplicate_attempts_ = enabled;
     }
@@ -62,6 +66,17 @@ protected:
         std::vector<int> final_team;
         int window_begin_t = 0;
         int window_end_t = 0;
+        std::vector<SubproblemConflict::ExpansionTraceStep> expansion_trace;
+        std::size_t attempts_launched = 0;
+        std::size_t cancelled_sibling_attempts = 0;
+        std::size_t winner_attempt_index = 0;
+        int winner_slot_index = -1;
+        std::uint32_t winner_planning_seed = 0;
+        std::uint64_t winner_worker_wall_ns = 0;
+        std::uint64_t patch_fingerprint = 0;
+        std::vector<std::uint64_t> local_patch_fingerprints;
+        std::vector<std::uint64_t> local_patch_arrival_timesteps;
+        std::vector<std::uint64_t> post_apply_global_arrival_timesteps;
     };
 
     struct ConflictRoundStats {
@@ -76,6 +91,11 @@ protected:
     void printConflictRoundStats(std::ostream &os) const;
 
 private:
+    void resetParallelArcRunState();
+    void finalizeParallelArcPlannerStats(
+        const ArcPlannerStatsSummary &planner_stats_summary,
+        const nlohmann::json &repair_failure_snapshot);
+
     struct InitialIndividualWorkerStats {
         int worker_index = -1;
         std::vector<int> robots;
@@ -117,6 +137,8 @@ private:
     ParallelArcConflictFindMode conflict_find_mode_ =
         ParallelArcConflictFindMode::SegmentParallel;
     std::size_t conflict_find_horizon_ = 400;
+    InterRobotConflictBatchMode conflict_batch_mode_ =
+        InterRobotConflictBatchMode::OptimisticIndependent;
     bool repair_duplicate_attempts_ = true;
     std::vector<ConflictRoundStats> conflict_round_stats_;
 };

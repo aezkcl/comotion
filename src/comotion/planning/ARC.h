@@ -131,15 +131,30 @@ protected:
         double initial_solution_times_seconds_cpu = 0.0;
         double initial_simplification_times_seconds_wall_clock = 0.0;
         double local_composite_simplification_times_seconds_wall_clock = 0.0;
+        double conflict_detection_times_seconds_wall_clock = 0.0;
+        double conflict_detection_times_seconds_cpu = 0.0;
         double conflict_resolution_times_seconds_wall_clock = 0.0;
         double conflict_resolution_times_seconds_total = 0.0;
         double conflict_resolution_times_seconds_cpu = 0.0;
         std::uint64_t subproblem_batches = 0;
     };
 
+    struct ProcessTreeCpuUsageSnapshot {
+        double self_seconds = 0.0;
+        double children_seconds = 0.0;
+    };
+
     using Clock = std::chrono::steady_clock;
 
     struct RepairWindow {
+        int window_start_t = 0;
+        int window_end_t = 0;
+        std::vector<int> history_event_ids;
+    };
+
+    struct AppliedRepairHistoryEvent {
+        int event_id = -1;
+        std::vector<int> robots;
         int window_start_t = 0;
         int window_end_t = 0;
     };
@@ -214,7 +229,23 @@ protected:
     static nlohmann::json
     plannerStatsJsonFromSummary(
         const ArcPlannerStatsSummary &summary,
-        const std::vector<double> *conflict_resolution_times_seconds = nullptr);
+        const std::vector<double> *conflict_resolution_times_seconds = nullptr,
+        const std::vector<double> *conflict_detection_times_seconds = nullptr);
+    static ProcessTreeCpuUsageSnapshot processTreeCpuUsageSnapshot();
+    static double elapsedProcessTreeCpuSeconds(
+        const ProcessTreeCpuUsageSnapshot &start,
+        const ProcessTreeCpuUsageSnapshot &finish);
+    static nlohmann::json temporaryConflictFindTimingJson(
+        const std::vector<double> &main_process_wall_seconds,
+        const std::vector<double> &process_tree_cpu_seconds,
+        const std::vector<double> &build_worker_wall_seconds,
+        const std::vector<double> &build_worker_cpu_seconds,
+        const std::vector<double> &collision_worker_wall_seconds,
+        const std::vector<double> &collision_worker_cpu_seconds,
+        const std::vector<int> &critical_worker_index,
+        const std::vector<double> &critical_worker_build_wall_seconds,
+        const std::vector<double> &critical_worker_collision_wall_seconds,
+        const std::vector<double> &critical_worker_total_wall_seconds);
 
     void initializeConflictScanStarts(std::size_t robot_count);
     CompositePathValidationOptions conflictScanOptions() const;
@@ -226,6 +257,10 @@ protected:
 
     void recordAppliedRepairHistory(const std::vector<int> &robots,
                                     int window_start_t, int window_end_t);
+    const std::vector<AppliedRepairHistoryEvent> &
+    appliedRepairHistoryEvents() const {
+        return applied_repair_history_events_;
+    }
 
     virtual SubproblemConflict
     expandConflictForSubproblem(const Conflict &conflict) const;
@@ -235,7 +270,11 @@ protected:
     // windows that intersect the proposed conflict patch window.
     std::vector<int> subproblemRobotsForConflict(int robot_i, int robot_j,
                                                  int window_start_t,
-                                                 int window_end_t) const;
+                                                 int window_end_t,
+                                                 std::vector<
+                                                     SubproblemConflict::
+                                                         ExpansionTraceStep> *
+                                                     trace_out = nullptr) const;
     const std::vector<RepairWindow> *
     repairWindowsForRobots(int robot_i, int robot_j) const;
     int conflictWindowStart(const Conflict &conflict) const {
@@ -244,6 +283,7 @@ protected:
     std::vector<Path> solution_paths_;
     std::map<int, std::map<int, std::vector<RepairWindow>>>
         repair_window_schedule_;
+    std::vector<AppliedRepairHistoryEvent> applied_repair_history_events_;
     std::size_t conflict_scan_robot_count_ = 0;
     std::vector<int> pair_conflict_scan_start_t_;
     std::vector<std::uint64_t> true_arrival_timesteps_;
@@ -275,6 +315,21 @@ protected:
     double initial_solution_times_seconds_cpu_ = 0.0;
     double initial_simplification_times_seconds_wall_clock_ = 0.0;
     double local_composite_simplification_times_seconds_wall_clock_ = 0.0;
+    std::vector<double> conflict_detection_times_seconds_;
+    std::vector<double> conflict_detection_times_cpu_seconds_;
+    // TEMP(ablation): remove these once the conflict-detection table
+    // reproduction no longer needs per-round worker build/collision timing.
+    std::vector<double> temporary_conflict_find_main_process_wall_seconds_;
+    std::vector<double> temporary_conflict_find_process_tree_cpu_seconds_;
+    std::vector<double> temporary_conflict_find_build_worker_wall_seconds_;
+    std::vector<double> temporary_conflict_find_build_worker_cpu_seconds_;
+    std::vector<double> temporary_conflict_find_collision_worker_wall_seconds_;
+    std::vector<double> temporary_conflict_find_collision_worker_cpu_seconds_;
+    std::vector<int> temporary_conflict_find_critical_worker_index_;
+    std::vector<double> temporary_conflict_find_critical_worker_build_wall_seconds_;
+    std::vector<double>
+        temporary_conflict_find_critical_worker_collision_wall_seconds_;
+    std::vector<double> temporary_conflict_find_critical_worker_total_wall_seconds_;
     std::vector<double> conflict_resolution_times_seconds_;
     std::vector<double> conflict_resolution_times_cpu_seconds_;
 };

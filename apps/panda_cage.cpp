@@ -97,14 +97,14 @@ struct AppOptions {
     std::size_t composite_aorrtc_max_internal_samples = 10000;
     std::size_t composite_aorrtc_max_internal_vertices = 10000;
     unsigned int cooperative_rrt_worker_threads = 2;
-    int arc_initial_window = 200;
-    double arc_expansion_step = 200.0;
-    std::string arc_expansion_policy = "linear";
+    int arc_initial_window = 20;
+    double arc_expansion_step = 1.05;
+    std::string arc_expansion_policy = "exponential";
     std::string arc_expansion_multipliers = "1,1,1,2,2,2,4,8";
-    std::optional<std::string> arc_initial_valid_expansion_policy;
-    std::optional<double> arc_initial_valid_expansion_step;
+    std::optional<std::string> arc_initial_valid_expansion_policy = "linear";
+    std::optional<double> arc_initial_valid_expansion_step = 20.0;
     std::optional<std::string> arc_initial_valid_expansion_multipliers;
-    bool arc_initial_valid_expansion_symmetric = true;
+    bool arc_initial_valid_expansion_symmetric = false;
     double arc_cspace_bound_margin = 2.0;
     double arc_min_cspace_bound_range = 2.0;
     unsigned int arc_simplification_max_shortcut_steps = 128;
@@ -116,9 +116,9 @@ struct AppOptions {
     unsigned int arc_conflict_simplification_max_empty_steps = 32;
     unsigned int arc_conflict_simplification_max_smooth_steps = 1;
     unsigned int arc_conflict_simplification_max_passes = 1;
-    unsigned int arc_local_composite_max_samples = 1000000;
+    unsigned int arc_local_composite_max_samples = 250000;
     double arc_local_composite_range = 0.0;
-    bool arc_local_composite_use_makespan_metric = false;
+    bool arc_local_composite_use_makespan_metric = true;
     bool arc_simplify_initial_solutions = true;
     bool arc_simplify_conflict_solutions = false;
     std::string arc_local_solvers = "composite";
@@ -127,11 +127,13 @@ struct AppOptions {
     unsigned int or_parallel_worker_processes = 1;
     unsigned int parallel_arc_worker_processes = 2;
     bool parallel_arc_parallel_initial_plans = true;
-    bool parallel_arc_initial_solution_or = false;
+    bool parallel_arc_initial_solution_or = true;
     bool parallel_arc_repair_duplicate_attempts = true;
     std::string parallel_arc_strategy = "synchronous";
     std::string parallel_arc_conflict_strategy = "greedy";
     std::string parallel_arc_conflict_find_mode = "segment_parallel";
+    std::string parallel_arc_conflict_find_assignment =
+        "cyclic_cover_greedy";
     std::string parallel_arc_conflict_batch_mode = "optimistic";
     std::size_t parallel_arc_conflict_find_horizon = 200;
     bool parallel_arc_conflict_ablation_only = false;
@@ -1008,14 +1010,14 @@ void printUsage(const char *prog) {
         << "  --drrt-local-connector <prioritized|synchronized> (default: prioritized)\n"
         << "  --drrt-exclude-roadmap-build-time\n"
         << "                         Give dRRT tensor search the full time limit after PRM* build\n"
-        << "  --arc-initial-window <n>\n"
-        << "  --arc-expansion-step <x>\n"
-        << "  --arc-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only)\n"
+        << "  --arc-initial-window <n> (default: 20)\n"
+        << "  --arc-expansion-step <x> (default: 1.05)\n"
+        << "  --arc-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only; default: exponential)\n"
         << "  --arc-expansion-multipliers <csv> (baseline ARC only; default: 1,1,1,2,2,2,4,8)\n"
-        << "  --arc-initial-valid-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only; default: main policy)\n"
-        << "  --arc-initial-valid-expansion-step <x> (baseline ARC only; default: main step)\n"
+        << "  --arc-initial-valid-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only; default: linear)\n"
+        << "  --arc-initial-valid-expansion-step <x> (baseline ARC only; default: 20)\n"
         << "  --arc-initial-valid-expansion-multipliers <csv> (baseline ARC only; default: main multipliers)\n"
-        << "  --arc-initial-valid-symmetric-expansion / --arc-initial-valid-asymmetric-expansion (baseline ARC only; default: symmetric)\n"
+        << "  --arc-initial-valid-symmetric-expansion / --arc-initial-valid-asymmetric-expansion (baseline ARC only; default: asymmetric)\n"
         << "  --arc-cspace-bound-margin <x> (default: 2)\n"
         << "  --arc-min-cspace-bound-range <x> (default: 2)\n"
         << "  --arc-simplification-max-shortcut-steps <n> (default: 128)\n"
@@ -1026,9 +1028,9 @@ void printUsage(const char *prog) {
         << "  --arc-conflict-simplification-max-empty-steps <n>\n"
         << "  --arc-conflict-simplification-max-smooth-steps <n>\n"
         << "  --arc-conflict-simplification-max-passes <n>\n"
-        << "  --arc-local-composite-max-samples <n>\n"
+        << "  --arc-local-composite-max-samples <n> (default: 250000)\n"
         << "  --arc-local-composite-range <x> (default: automatic)\n"
-        << "  --arc-local-composite-use-makespan-metric\n"
+        << "  --arc-local-composite-use-makespan-metric (default: on)\n"
         << "  --arc-simplify-initial-solutions / --no-arc-simplify-initial-solutions (default: on)\n"
         << "  --arc-simplify-conflict-solutions / --no-arc-simplify-conflict-solutions (default: off)\n"
         << "  --composite-rrt-use-makespan-metric\n"
@@ -1043,13 +1045,14 @@ void printUsage(const char *prog) {
         << "  --or-parallel-worker-processes <n>\n"
         << "  --parallel-arc-worker-processes <n>\n"
         << "  --parallel-arc-parallel-initial-plans / --no-parallel-arc-parallel-initial-plans (default: on)\n"
-        << "  --parallel-arc-initial-solution-or / --no-parallel-arc-initial-solution-or (default: off)\n"
+        << "  --parallel-arc-initial-solution-or / --no-parallel-arc-initial-solution-or (default: on)\n"
         << "  --parallel-arc-repair-duplicate-attempts / --no-parallel-arc-repair-duplicate-attempts (default: on)\n"
         << "  --parallel-arc-strategy <synchronous|asynchronous>\n"
         << "  --parallel-arc-conflict-strategy <greedy|spatial_distribution>\n"
         << "  --parallel-arc-conflict-find-mode <sequential|segment_parallel>\n"
-        << "  --parallel-arc-conflict-batch-mode <optimistic|independent_only>\n"
-        << "  --parallel-arc-conflict-find-horizon <n>\n"
+        << "  --parallel-arc-conflict-find-assignment <auto|pair_cover|round_robin|balanced_pair_cover|pair_first_greedy|cyclic_cover_greedy> (default: cyclic_cover_greedy)\n"
+        << "  --parallel-arc-conflict-batch-mode <optimistic|independent_only> (default: optimistic)\n"
+        << "  --parallel-arc-conflict-find-horizon <n> (default: 200)\n"
         << "  --parallel-arc-conflict-ablation-only\n"
         << "                         Generate initial individual paths, then time only one\n"
         << "                         ParallelARC conflict-detection call on those fixed paths\n"
@@ -1294,6 +1297,9 @@ AppOptions parseArgs(int argc, char **argv) {
         } else if (arg == "--parallel-arc-conflict-find-mode") {
             options.parallel_arc_conflict_find_mode =
                 requireValue(i, argc, argv, arg);
+        } else if (arg == "--parallel-arc-conflict-find-assignment") {
+            options.parallel_arc_conflict_find_assignment =
+                requireValue(i, argc, argv, arg);
         } else if (arg == "--parallel-arc-conflict-batch-mode") {
             options.parallel_arc_conflict_batch_mode =
                 requireValue(i, argc, argv, arg);
@@ -1421,6 +1427,20 @@ AppOptions parseArgs(int argc, char **argv) {
         throw std::runtime_error(
             "--parallel-arc-conflict-find-horizon must be at least 1 for "
             "segment_parallel mode");
+    }
+    const auto conflict_find_assignment =
+        common::parseParallelArcConflictFindAssignment(
+            options.parallel_arc_conflict_find_assignment);
+    if ((conflict_find_assignment ==
+             comotion::ConflictFindParallelAssignment::PairFirstGreedy ||
+         conflict_find_assignment ==
+             comotion::ConflictFindParallelAssignment::CyclicCoverGreedy) &&
+        options.collision_backend !=
+            comotion::CollisionChecker::Backend::Vamp) {
+        throw std::runtime_error(
+            options.parallel_arc_conflict_find_assignment +
+            " conflict assignment currently requires the VAMP collision "
+            "backend");
     }
     if (options.parallel_arc_conflict_ablation_only) {
         if (options.algorithm != "parallel_arc") {

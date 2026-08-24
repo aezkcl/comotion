@@ -335,6 +335,28 @@ parseParallelArcConflictBatchMode(const std::string &value) {
         "Unknown ParallelARC conflict batch mode: " + value);
 }
 
+inline comotion::ConflictFindParallelAssignment
+parseParallelArcConflictFindAssignment(const std::string &value) {
+    std::string lowered = lowerAscii(value);
+    std::replace(lowered.begin(), lowered.end(), '-', '_');
+    if (lowered == "auto")
+        return comotion::ConflictFindParallelAssignment::Auto;
+    if (lowered == "pair_cover")
+        return comotion::ConflictFindParallelAssignment::PairCover;
+    if (lowered == "round_robin") {
+        return comotion::ConflictFindParallelAssignment::
+            AllRobotsRoundRobin;
+    }
+    if (lowered == "balanced_pair_cover")
+        return comotion::ConflictFindParallelAssignment::BalancedPairCover;
+    if (lowered == "pair_first_greedy")
+        return comotion::ConflictFindParallelAssignment::PairFirstGreedy;
+    if (lowered == "cyclic_cover_greedy")
+        return comotion::ConflictFindParallelAssignment::CyclicCoverGreedy;
+    throw std::runtime_error(
+        "Unknown ParallelARC conflict-find assignment: " + value);
+}
+
 template <typename Options>
 auto parallelArcConflictBatchModeValueImpl(const Options &options, int)
     -> decltype(options.parallel_arc_conflict_batch_mode) {
@@ -686,6 +708,27 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             auto planner = std::make_shared<comotion::AOARC>();
             planner->setInitialWindow(options.arc_initial_window);
             planner->setExpansionStep(options.arc_expansion_step);
+            planner->setExpansionPolicy(
+                parseArcExpansionPolicy(options.arc_expansion_policy));
+            planner->setCustomExpansionMultipliers(
+                parseArcExpansionMultipliers(
+                    options.arc_expansion_multipliers));
+            if (options.arc_initial_valid_expansion_policy) {
+                planner->setInitialValidWindowExpansionPolicy(
+                    parseArcExpansionPolicy(
+                        *options.arc_initial_valid_expansion_policy));
+            }
+            if (options.arc_initial_valid_expansion_step) {
+                planner->setInitialValidWindowExpansionStep(
+                    *options.arc_initial_valid_expansion_step);
+            }
+            if (options.arc_initial_valid_expansion_multipliers) {
+                planner->setInitialValidWindowExpansionMultipliers(
+                    parseArcExpansionMultipliers(
+                        *options.arc_initial_valid_expansion_multipliers));
+            }
+            planner->setInitialValidWindowExpansionSymmetric(
+                options.arc_initial_valid_expansion_symmetric);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
             planner->setLocalCompositeRrtRange(
@@ -834,6 +877,27 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             auto planner = std::make_shared<comotion::ParallelARC>();
             planner->setInitialWindow(options.arc_initial_window);
             planner->setExpansionStep(options.arc_expansion_step);
+            planner->setExpansionPolicy(
+                parseArcExpansionPolicy(options.arc_expansion_policy));
+            planner->setCustomExpansionMultipliers(
+                parseArcExpansionMultipliers(
+                    options.arc_expansion_multipliers));
+            if (options.arc_initial_valid_expansion_policy) {
+                planner->setInitialValidWindowExpansionPolicy(
+                    parseArcExpansionPolicy(
+                        *options.arc_initial_valid_expansion_policy));
+            }
+            if (options.arc_initial_valid_expansion_step) {
+                planner->setInitialValidWindowExpansionStep(
+                    *options.arc_initial_valid_expansion_step);
+            }
+            if (options.arc_initial_valid_expansion_multipliers) {
+                planner->setInitialValidWindowExpansionMultipliers(
+                    parseArcExpansionMultipliers(
+                        *options.arc_initial_valid_expansion_multipliers));
+            }
+            planner->setInitialValidWindowExpansionSymmetric(
+                options.arc_initial_valid_expansion_symmetric);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
             planner->setLocalCompositeRrtRange(
@@ -909,6 +973,9 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             }
             planner->setConflictFindHorizon(
                 options.parallel_arc_conflict_find_horizon);
+            planner->setConflictFindParallelAssignment(
+                parseParallelArcConflictFindAssignment(
+                    options.parallel_arc_conflict_find_assignment));
             planner->setConflictBatchMode(parseParallelArcConflictBatchMode(
                 parallelArcConflictBatchModeValue(options)));
             return planner;

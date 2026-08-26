@@ -59,6 +59,7 @@ struct AppOptions {
     std::size_t resolution = 128;
     std::string output_dir = "benchmarks/results/mobile_robot_2d_crossing";
     bool output_paths = false;
+    bool track_arc_history = false;
     bool output_endpoint_paths = false;
     std::optional<std::string> metrics_json_path;
     bool exit_nonzero_without_exact_solution = false;
@@ -107,6 +108,9 @@ struct AppOptions {
     bool arc_simplify_conflict_solutions = false;
     std::string arc_local_solvers = "composite";
     unsigned int arc_local_prioritized_max_iterations = 5;
+    bool arc_local_prioritized_return_first_solution = true;
+    std::string arc_local_prioritized_rewiring = "knearest";
+    bool arc_local_prioritized_persist_at_goal = false;
     std::uint64_t ao_arc_local_bound_epsilon_timesteps = 1;
     unsigned int or_parallel_worker_processes = 1;
     unsigned int parallel_arc_worker_processes = 2;
@@ -212,14 +216,19 @@ void writePathArtifacts(const TrialMetrics &metrics,
                         const std::shared_ptr<comotion::MultiRobotProblem> &problem,
                         const std::vector<comotion::Path> &paths,
                         const std::filesystem::path &output_dir,
-                        const std::string &basename) {
+                        const std::string &basename,
+                        const std::shared_ptr<comotion::MultiRobotPlanner> &planner = {},
+                        bool output_paths = false,
+                        bool track_arc_history = false) {
     std::filesystem::create_directories(output_dir);
 
     auto robot_models = problem->robotModelPtrs();
+    const auto export_paths = common::densePathsForExport(
+        paths, problem->resolution(), problem->vmax());
     comotion::CompositePathValidationOptions validation_options;
     validation_options.check_environment = true;
     auto conflict = problem->collisionChecker().findFirstCompositePathConflict(
-        paths, robot_models, validation_options);
+        export_paths, robot_models, validation_options);
 
     json out;
     out["schema_version"] = "1.0";
@@ -253,8 +262,8 @@ void writePathArtifacts(const TrialMetrics &metrics,
 
     std::size_t timesteps = 0;
     double total_path_cost = 0.0;
-    for (std::size_t r = 0; r < paths.size(); ++r) {
-        const auto &path = paths[r];
+    for (std::size_t r = 0; r < export_paths.size(); ++r) {
+        const auto &path = export_paths[r];
         timesteps = std::max(timesteps, path.size());
         total_path_cost += path.path_cost();
 
@@ -292,6 +301,9 @@ void writePathArtifacts(const TrialMetrics &metrics,
 
     out["timesteps"] = timesteps;
     out["total_path_cost"] = total_path_cost;
+    common::appendArcVisualization(out, planner, output_paths,
+                                   track_arc_history, problem->resolution(),
+                                   problem->vmax());
 
     writeJson(out, output_dir / (basename + "_" + metrics.planner + "_result.json"),
               2);
@@ -306,6 +318,8 @@ TrialMetrics runPlanner(
     comotion::seedOmplGlobalFromUserPlanningSeed(options.seed);
     planner->setPlanningSeed(options.seed);
     planner->setProblem(problem);
+    common::enableArcHistoryTracking(
+        planner, options.output_paths, options.track_arc_history);
 
     if (g_app_verbose)
         std::cout << "Running " << planner_name << "\n";
@@ -351,12 +365,17 @@ TrialMetrics runPlanner(
     }
 
     if (options.output_paths) {
-        if (metrics.success) {
+        const auto *history_paths = common::arcHistoryArtifactPaths(
+            planner, options.output_paths, options.track_arc_history);
+        if (metrics.success || history_paths) {
+            const auto artifact_paths =
+                metrics.success ? planner->getSolutionPaths() : *history_paths;
             writePathArtifacts(metrics, generated, problem,
-                               planner->getSolutionPaths(),
-                               options.output_dir, basename);
+                               artifact_paths, options.output_dir, basename,
+                               planner, options.output_paths,
+                               options.track_arc_history);
         } else if (g_app_verbose) {
-            std::cout << "No exact solution; skipping path artifacts\n";
+            std::cout << "No complete path set; skipping path artifacts\n";
         }
     }
 
@@ -461,6 +480,7 @@ void printUsage(const char *prog) {
         << "  --resolution <n>         Timesteps per second (default: 128)\n"
         << "  --metrics-json <path>    Write compact trial metrics JSON\n"
         << "  --output-paths           Write visualization result JSON and .pth files\n"
+        << "  --track-arc-history      With --output-paths, embed ARC process history\n"
         << "  --output-endpoint-paths  Write fake two-state start/goal paths and exit\n"
         << "  --output-dir <dir>       Output directory for path artifacts\n"
         << "      (default: benchmarks/results/mobile_robot_2d_crossing)\n"
@@ -508,6 +528,9 @@ void printUsage(const char *prog) {
         << "  --aorrtc-max-internal-vertices <n>\n"
         << "  --arc-local-solvers <both|prioritized|composite> (default: composite)\n"
         << "  --arc-local-prioritized-max-iterations <n> (default: 5; 0 disables cap)\n"
+        << "  --arc-local-prioritized-return-first-solution <0|1> (default: 1)\n"
+        << "  --arc-local-prioritized-rewiring <off|radius|knearest> (default: knearest)\n"
+        << "  --arc-local-prioritized-persist-at-goal / --no-arc-local-prioritized-persist-at-goal\n"
         << "  --ao-arc-local-bound-epsilon-timesteps <n> (default: 1; 0 disables)\n"
         << "  --cooperative-rrt-worker-threads <n>\n"
         << "  --stcbs-range <x>\n"
@@ -584,6 +607,8 @@ AppOptions parseArgs(int argc, char **argv) {
             options.metrics_json_path = requireValue(i, argc, argv, arg);
         } else if (arg == "--output-paths") {
             options.output_paths = true;
+        } else if (arg == "--track-arc-history") {
+            options.track_arc_history = true;
         } else if (arg == "--output-endpoint-paths" ||
                    arg == "--output-fake-paths") {
             options.output_endpoint_paths = true;
@@ -734,6 +759,16 @@ AppOptions parseArgs(int argc, char **argv) {
             options.arc_local_prioritized_max_iterations =
                 static_cast<unsigned int>(
                     std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--arc-local-prioritized-return-first-solution") {
+            options.arc_local_prioritized_return_first_solution =
+                common::parseBoolValue(requireValue(i, argc, argv, arg));
+        } else if (arg == "--arc-local-prioritized-rewiring") {
+            options.arc_local_prioritized_rewiring =
+                requireValue(i, argc, argv, arg);
+        } else if (arg == "--arc-local-prioritized-persist-at-goal") {
+            options.arc_local_prioritized_persist_at_goal = true;
+        } else if (arg == "--no-arc-local-prioritized-persist-at-goal") {
+            options.arc_local_prioritized_persist_at_goal = false;
         } else if (arg == "--ao-arc-local-bound-epsilon-timesteps") {
             options.ao_arc_local_bound_epsilon_timesteps =
                 static_cast<std::uint64_t>(
@@ -842,120 +877,21 @@ AppOptions parseArgs(int argc, char **argv) {
         throw std::runtime_error("--time-limit must be positive");
     if (options.resolution == 0)
         throw std::runtime_error("--resolution must be at least 1");
-    if (options.strrt_initial_batch_size == 0)
-        throw std::runtime_error(
-            "--strrt-initial-batch-size must be at least 1");
-    if (options.strrt_initial_time_factor <= 1.0)
-        throw std::runtime_error(
-            "--strrt-initial-time-factor must be greater than 1.0");
-    if (options.strrt_time_bound_factor_increase <= 1.0)
-        throw std::runtime_error(
-            "--strrt-time-bound-factor-increase must be greater than 1.0");
-    (void)common::parseStrrtRewiring(options.strrt_rewiring);
-    if (options.drrt_roadmap_size < 2)
-        throw std::runtime_error("--drrt-roadmap-size must be at least 2");
-    if (options.drrt_iterations_per_batch < 1)
-        throw std::runtime_error(
-            "--drrt-iterations-per-batch must be at least 1");
-    (void)common::parseDrrtCostMetric(options.drrt_cost_metric);
-    (void)common::parseDrrtTensorSearchMode(options.drrt_tensor_search);
-    (void)common::parseDrrtLocalConnectorMode(options.drrt_local_connector);
-    (void)common::parseVampValidationStrategy(
-        options.vamp_validation_strategy);
-    if (options.composite_aorrtc_max_internal_samples == 0)
-        throw std::runtime_error(
-            "--aorrtc-max-internal-samples must be at least 1");
-    if (options.composite_aorrtc_max_internal_vertices == 0)
-        throw std::runtime_error(
-            "--aorrtc-max-internal-vertices must be at least 1");
-    if (options.cooperative_rrt_worker_threads == 0)
-        throw std::runtime_error(
-            "--cooperative-rrt-worker-threads must be at least 1");
-    if (options.arc_initial_window < 1)
-        throw std::runtime_error("--arc-initial-window must be at least 1");
-    if (!std::isfinite(options.arc_expansion_step) ||
-        options.arc_expansion_step <= 0.0)
-        throw std::runtime_error("--arc-expansion-step must be positive");
-    (void)common::parseArcExpansionPolicy(options.arc_expansion_policy);
-    (void)common::parseArcExpansionMultipliers(
-        options.arc_expansion_multipliers);
-    if (options.arc_initial_valid_expansion_policy) {
-        (void)common::parseArcExpansionPolicy(
-            *options.arc_initial_valid_expansion_policy);
-    }
-    if (options.arc_initial_valid_expansion_step &&
-        (!std::isfinite(*options.arc_initial_valid_expansion_step) ||
-         *options.arc_initial_valid_expansion_step <= 0.0)) {
-        throw std::runtime_error(
-            "--arc-initial-valid-expansion-step must be positive");
-    }
-    if (options.arc_initial_valid_expansion_multipliers) {
-        (void)common::parseArcExpansionMultipliers(
-            *options.arc_initial_valid_expansion_multipliers);
-    }
-    if (options.arc_cspace_bound_margin < 0.0)
-        throw std::runtime_error(
-            "--arc-cspace-bound-margin must be non-negative");
-    if (options.arc_min_cspace_bound_range < 0.0)
-        throw std::runtime_error(
-            "--arc-min-cspace-bound-range must be non-negative");
-    if (options.arc_local_composite_range < 0.0)
-        throw std::runtime_error(
-            "--arc-local-composite-range must be non-negative");
-    (void)parseArcLocalSolverMode(options.arc_local_solvers);
-    if (options.or_parallel_worker_processes == 0)
-        throw std::runtime_error(
-            "--or-parallel-worker-processes must be at least 1");
-    if (options.parallel_arc_worker_processes == 0)
-        throw std::runtime_error(
-            "--parallel-arc-worker-processes must be at least 1");
-    if (options.parallel_arc_conflict_find_mode == "segment_parallel" &&
-        options.parallel_arc_conflict_find_horizon == 0) {
-        throw std::runtime_error(
-            "--parallel-arc-conflict-find-horizon must be at least 1 for "
-            "segment_parallel mode");
-    }
-    const auto conflict_find_assignment =
-        common::parseParallelArcConflictFindAssignment(
-            options.parallel_arc_conflict_find_assignment);
-    if ((conflict_find_assignment ==
-             comotion::ConflictFindParallelAssignment::PairFirstGreedy ||
-         conflict_find_assignment ==
-             comotion::ConflictFindParallelAssignment::CyclicCoverGreedy) &&
-        options.collision_backend !=
-            comotion::CollisionChecker::Backend::Vamp) {
-        throw std::runtime_error(
-            options.parallel_arc_conflict_find_assignment +
-            " conflict assignment currently requires the VAMP collision "
-            "backend");
-    }
-    if (options.parallel_arc_conflict_ablation_only) {
-        if (options.algorithm != "parallel_arc") {
+    common::validateSelectedPlannerOptions(options,
+                                           !options.output_endpoint_paths);
+    if (options.algorithm == "stcbs") {
+        if (options.stcbs_range <= 0.0)
+            throw std::runtime_error("--stcbs-range must be positive");
+        if (options.stcbs_goal_threshold <= 0.0)
+            throw std::runtime_error("--stcbs-goal-threshold must be positive");
+        if (options.stcbs_layer_dt <= 0.0)
+            throw std::runtime_error("--stcbs-layer-dt must be positive");
+        if (options.stcbs_lambda < 0.0 || options.stcbs_lambda > 1.0)
+            throw std::runtime_error("--stcbs-lambda must be in [0, 1]");
+        if (options.stcbs_occupied_radius < 0.0)
             throw std::runtime_error(
-                "--parallel-arc-conflict-ablation-only requires "
-                "--algorithm parallel_arc");
-        }
-        if (options.or_parallel_worker_processes != 1) {
-            throw std::runtime_error(
-                "--parallel-arc-conflict-ablation-only does not support "
-                "outer OR parallelism");
-        }
+                "--stcbs-occupied-radius must be non-negative");
     }
-    if (options.stcbs_max_ct_nodes < 1)
-        throw std::runtime_error("--stcbs-max-ct-nodes must be at least 1");
-    if (options.stcbs_max_samples < 1)
-        throw std::runtime_error("--stcbs-max-samples must be at least 1");
-    if (options.stcbs_range <= 0.0)
-        throw std::runtime_error("--stcbs-range must be positive");
-    if (options.stcbs_goal_threshold <= 0.0)
-        throw std::runtime_error("--stcbs-goal-threshold must be positive");
-    if (options.stcbs_layer_dt <= 0.0)
-        throw std::runtime_error("--stcbs-layer-dt must be positive");
-    if (options.stcbs_lambda < 0.0 || options.stcbs_lambda > 1.0)
-        throw std::runtime_error("--stcbs-lambda must be in [0, 1]");
-    if (options.stcbs_occupied_radius < 0.0)
-        throw std::runtime_error(
-            "--stcbs-occupied-radius must be non-negative");
 
     return options;
 }

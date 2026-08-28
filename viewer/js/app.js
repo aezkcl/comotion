@@ -6,7 +6,14 @@
 import * as THREE from "three";
 import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
 import { parseResult, configAt } from "./schema.js";
-import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=2";
+import {
+  arcFrameDurationTimesteps,
+  buildArcTimeline,
+  configAtPath,
+  conflictRobots,
+  firstReachedConflict,
+} from "./arc-playback.js";
+import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=9";
 
 // Panda 7-DOF joint names (matches planner config order)
 const PANDA_JOINT_NAMES = [
@@ -17,8 +24,11 @@ const PANDA_JOINT_NAMES = [
 // State
 let scene, camera, renderer, controls;
 let ambientLight = null;
+let hemisphereLight = null;
 let sunLight = null;
-/** When true: dim ambient + directional sun (shadows). When false: bright ambient, sun off. */
+let fillLight = null;
+let rimLight = null;
+/** When true: key/fill lighting with shadows. When false: bright ambient, directional lights off. */
 let lightingKeyMode = true;
 /** When true: URDF robots show collision primitives; when false: visual meshes only. */
 let showRobotCollisionGeometry = false;
@@ -26,16 +36,32 @@ let showRobotCollisionGeometry = false;
 let showCrossSection2D = false;
 let resultData = null;
 let currentTimestep = 0;
+let playbackMode = "solution";
+let arcTimeline = [];
 let robotMeshes = [];
 let obstacleMeshes = [];
 let crossSection2DGroup = null;
 let isPlaying = false;
-let playIntervalId = null;
+let playTimerId = null;
+let playbackSpeedMultiplier = 1;
 const PLAY_FPS = 12;
+const ARC_PATH_COLOR = 0xaeb4bb;
+const ARC_CONFLICT_COLOR = 0xd62828;
+const ARC_SOLUTION_COLOR = 0x2f9e44;
+const ARC_GROUP_COLORS = [
+  0x1976d2,
+  0xf57c00,
+  0x7b1fa2,
+  0x00897b,
+  0xc2185b,
+  0x689f38,
+];
 const CROSS_SECTION_Z = 0;
 const CROSS_SECTION_EPS = 1e-6;
 const PLANAR3_LINK_LENGTH = 0.3;
 const PLANAR3_LINK_RADIUS = 0.05;
+const DEFAULT_PANDA_VISUAL_URDF_PATH = "resources/panda/panda.urdf";
+const PANDA_RESOURCE_REVISION = "20260824-real-visual-1";
 
 function scaleRgbHex(hex, k) {
   const r = Math.round(((hex >> 16) & 0xff) * k);
@@ -44,30 +70,147 @@ function scaleRgbHex(hex, k) {
   return (r << 16) | (g << 8) | b;
 }
 
-/** Prior light gray, darkened 20% (RGB scale 0.8). */
-const OBSTACLE_COLOR = scaleRgbHex(0xd4d4d4, 0.8);
+/** Prior obstacle gray (0xaaaaaa), lightened by 40% per RGB channel. */
+const OBSTACLE_COLOR = scaleRgbHex(0xaaaaaa, 1.4);
+const OBSTACLE_OPACITY = 0.45;
 
-/** One saturated color per robot (URDF + placeholders). */
-function randomRobotColorHex() {
-  const h = Math.random();
-  const s = 0.52 + Math.random() * 0.35;
-  const l = 0.4 + Math.random() * 0.22;
-  return new THREE.Color().setHSL(h, s, l).getHex();
+const ROBOT_COLOR_PALETTES = [
+  {
+    id: "neutral",
+    label: "Neutral",
+    emissiveIntensity: 1.15,
+    receiveShadows: false,
+    colors: [
+      0x00ffff, // electric cyan
+      0xff00ff, // electric magenta
+      0xffff00, // electric yellow
+      0x39ff14, // laser green
+      0xff073a, // neon red
+      0x00ffcc, // aqua glow
+      0xff1493, // hot pink
+      0xccff00, // acid chartreuse
+      0xff5f1f, // blaze orange
+      0x00b7ff, // plasma blue
+      0xee00ff, // neon violet
+      0xaaff00, // toxic lime
+      0xffea00, // highlighter yellow
+      0x00ff66, // green glow
+      0xff0099, // punch pink
+      0x33ffff, // ice cyan
+      0xff3300, // hot vermilion
+      0xbfff00, // volt green
+      0x00ff99, // mint beam
+      0xff00cc, // hot magenta
+      0x99ff00, // neon grass
+      0xff9900, // signal orange
+      0x00ffef, // bright turquoise
+      0xda00ff, // ultraviolet
+    ],
+  },
+  {
+    id: "royal",
+    label: "Royal",
+    colors: [
+      0x0033a0, // royal blue
+      0xd4af37, // metallic gold
+      0x6a0dad, // royal purple
+      0x005a32, // deep emerald
+      0x9b111e, // ruby
+      0x0047ab, // cobalt
+      0x702963, // byzantium
+      0x0f52ba, // sapphire
+      0x800020, // burgundy
+      0x006b54, // jade
+      0xc04000, // mahogany orange
+      0x32127a, // persian indigo
+      0xb31b1b, // garnet
+      0x008080, // regal teal
+      0x4b0082, // indigo
+      0xe0b0ff, // mauve
+      0xbf5700, // burnt gold
+      0x5d3fd3, // iris
+      0x006400, // royal green
+      0x8b008b, // deep magenta
+      0x1f305e, // midnight blue
+      0xa67c00, // antique gold
+      0x722f37, // wine
+      0x2e8b57, // sea emerald
+    ],
+  },
+  {
+    id: "neon",
+    label: "Neon",
+    emissiveIntensity: 2.4,
+    receiveShadows: false,
+    colors: [
+      0x00ffff, // bright cyan
+      0xff00cc, // neon pink
+      0xff5a00, // bright orange
+      0xffff00, // highlighter yellow
+      0x39ff14, // laser green
+      0xff007f, // hot rose
+      0x00bfff, // electric sky
+      0xff3300, // blaze vermilion
+      0xccff00, // acid chartreuse
+      0xff00ff, // pure magenta
+      0x00ff99, // glowing mint
+      0xff9900, // signal orange
+      0x7df9ff, // electric blue
+      0xff1493, // hot pink
+      0xadff2f, // green yellow
+      0xff6600, // safety orange
+      0x00ffef, // neon turquoise
+      0xfe019a, // fluorescent pink
+      0xfefe22, // fluorescent yellow
+      0xff00aa, // electric fuchsia
+      0x00ff33, // laser lime
+      0xff6ec7, // neon cotton candy
+      0xff2400, // scarlet neon
+      0xb6ff00, // toxic lime
+    ],
+  },
+];
+
+const ROBOT_COLOR_PALETTE_BY_ID = new Map(ROBOT_COLOR_PALETTES.map((palette) => [palette.id, palette]));
+let selectedRobotPaletteId = ROBOT_COLOR_PALETTES[0].id;
+
+function currentRobotPaletteSpec() {
+  return ROBOT_COLOR_PALETTE_BY_ID.get(selectedRobotPaletteId) || ROBOT_COLOR_PALETTES[0];
 }
 
-function createRobotSurfaceMaterial(hex) {
-  return new THREE.MeshLambertMaterial({
+function currentRobotColorPalette() {
+  return currentRobotPaletteSpec().colors;
+}
+
+function robotColorHexForIndex(index) {
+  const palette = currentRobotColorPalette();
+  return palette[index % palette.length];
+}
+
+function robotColorStyleKey(hex) {
+  return `robot-${selectedRobotPaletteId}-${hex.toString(16).padStart(6, "0")}`;
+}
+
+function createRobotSurfaceMaterial(hex, styleKey = robotColorStyleKey(hex)) {
+  const glow = currentRobotPaletteSpec().emissiveIntensity ?? 0;
+  const material = new THREE.MeshLambertMaterial({
     color: hex,
+    emissive: glow > 0 ? hex : 0x000000,
+    emissiveIntensity: glow,
     vertexColors: false,
     transparent: false,
     opacity: 1,
     depthWrite: true,
     side: THREE.DoubleSide,
   });
+  material.toneMapped = glow <= 0;
+  material.userData.comotionSolidColor = hex;
+  material.userData.comotionColorStyleKey = styleKey;
+  return material;
 }
 
 // DOM refs
-let timestepEl, playPauseBtn, sliderEl;
+let timestepEl, playPauseBtn, sliderEl, playbackModeSelectEl, playbackSpeedSelectEl;
 let cameraPanelEl = null;
 
 function fmtNum(v, digits = 4) {
@@ -880,7 +1023,7 @@ function addResultObstacles2DCrossSection(group, data) {
         radius,
         OBSTACLE_COLOR,
         0,
-        0.74,
+        OBSTACLE_OPACITY,
         10,
         outlineColor
       )) count++;
@@ -901,7 +1044,7 @@ function addResultObstacles2DCrossSection(group, data) {
         halfLength,
         OBSTACLE_COLOR,
         0,
-        0.74,
+        OBSTACLE_OPACITY,
         10,
         outlineColor
       )) count++;
@@ -1081,8 +1224,12 @@ function addPlanar3CollisionCircle(group, center, colorHex) {
   );
 }
 
+function displayConfigForEntry(entry) {
+  return entry.playbackConfig ?? configAt(entry.robot, currentTimestep);
+}
+
 function addPlanar3RobotVisualCrossSection2D(group, entry, colorHex) {
-  const cfg = configAt(entry.robot, currentTimestep);
+  const cfg = displayConfigForEntry(entry);
   const base = robotBasePose2D(entry.robot);
   let joint = base.position.clone();
   let theta = base.yaw;
@@ -1112,7 +1259,7 @@ function addPlanar3RobotVisualCrossSection2D(group, entry, colorHex) {
 }
 
 function addPlanar3RobotCollisionCrossSection2D(group, entry, colorHex) {
-  const cfg = configAt(entry.robot, currentTimestep);
+  const cfg = displayConfigForEntry(entry);
   const base = robotBasePose2D(entry.robot);
   let joint = base.position.clone();
   let theta = base.yaw;
@@ -1180,19 +1327,26 @@ function refreshCrossSection2D() {
   const group = new THREE.Group();
   group.name = "z0_cross_section_2d";
   addResultObstacles2DCrossSection(group, resultData);
-  robotMeshes.forEach((entry) => addRobotEntry2DCrossSection(group, entry));
+  robotMeshes.forEach((entry) => {
+    if (entry.playbackVisible !== false)
+      addRobotEntry2DCrossSection(group, entry);
+  });
   group.visible = showCrossSection2D;
   crossSection2DGroup = group;
   scene.add(group);
 }
 
-function createRobotLineMaterial(hex) {
-  return new THREE.LineBasicMaterial({
+function createRobotLineMaterial(hex, styleKey = robotColorStyleKey(hex)) {
+  const material = new THREE.LineBasicMaterial({
     color: hex,
     transparent: false,
     opacity: 1,
     depthWrite: true,
+    depthTest: true,
   });
+  material.userData.comotionSolidColor = hex;
+  material.userData.comotionColorStyleKey = styleKey;
+  return material;
 }
 
 function isUrdfVisualNode(obj) {
@@ -1224,12 +1378,44 @@ function countUrdfColliderRoots(urdfRobot) {
   return n;
 }
 
+function summarizeUrdfGeometry(urdfRobot) {
+  const visualMeshes = new Set();
+  const collisionMeshes = new Set();
+  urdfRobot.traverse((branch) => {
+    const target = isUrdfVisualNode(branch)
+      ? visualMeshes
+      : isUrdfColliderNode(branch)
+        ? collisionMeshes
+        : null;
+    if (!target) return;
+    branch.traverse((obj) => {
+      if (obj.isMesh) target.add(obj);
+    });
+  });
+
+  const summarize = (meshes) => {
+    let triangles = 0;
+    for (const mesh of meshes) {
+      const drawCount = mesh.geometry?.index?.count ??
+        mesh.geometry?.attributes?.position?.count ?? 0;
+      triangles += Math.floor(drawCount / 3);
+    }
+    return { meshes: meshes.size, triangles };
+  };
+  return {
+    visual: summarize(visualMeshes),
+    collision: summarize(collisionMeshes),
+  };
+}
+
 function applyRobotGeometryModeToScene() {
   const show3D = !showCrossSection2D;
-  robotMeshes.forEach(({ mesh, urdfRobot, collisionUrdfRobot }) => {
-    if (mesh) mesh.visible = show3D;
+  robotMeshes.forEach((entry) => {
+    const { mesh, urdfRobot, collisionUrdfRobot } = entry;
+    const showRobot = entry.playbackVisible !== false;
+    if (mesh) mesh.visible = show3D && showRobot;
 
-    if (!show3D) {
+    if (!show3D || !showRobot) {
       if (urdfRobot) urdfRobot.visible = false;
       if (collisionUrdfRobot && collisionUrdfRobot !== urdfRobot) {
         collisionUrdfRobot.visible = false;
@@ -1271,7 +1457,9 @@ function applySceneDisplayMode() {
 function syncGeometryToggleButton() {
   const btn = document.getElementById("geometry-toggle");
   if (!btn) return;
-  btn.textContent = showRobotCollisionGeometry ? "Collision geo" : "Visual geo";
+  btn.textContent = showRobotCollisionGeometry
+    ? "Showing collision"
+    : "Showing visual";
   btn.title = showRobotCollisionGeometry
     ? "Showing URDF collision primitives. Click for visual meshes."
     : "Showing URDF visual meshes. Click for collision geometry.";
@@ -1329,37 +1517,126 @@ function toggleCrossSection2DMode() {
   setCrossSection2DMode(!showCrossSection2D);
 }
 
-/**
- * Replace every drawable material on a robot with a solid flat color.
- * OBJ polylines become LineSegments with default white LineBasicMaterial unless handled here.
- */
+function isStyledRobotMaterial(material, colorHex, requireDoubleSide, styleKey) {
+  return material?.userData?.comotionSolidColor === colorHex &&
+    material?.userData?.comotionColorStyleKey === styleKey &&
+    material.transparent === false &&
+    material.opacity === 1 &&
+    material.depthWrite === true &&
+    material.depthTest === true &&
+    material.colorWrite !== false &&
+    material.wireframe !== true &&
+    (!requireDoubleSide || material.side === THREE.DoubleSide);
+}
+
+function disposeMaterialList(material) {
+  if (Array.isArray(material)) {
+    material.forEach((m) => m?.dispose?.());
+    return;
+  }
+  material?.dispose?.();
+}
+
+function ensureMaterial(material, colorHex, requireDoubleSide, styleKey, factory) {
+  if (Array.isArray(material)) {
+    const styled = material.length > 0 &&
+      material.every((m) => isStyledRobotMaterial(m, colorHex, requireDoubleSide, styleKey));
+    if (styled) return material;
+    disposeMaterialList(material);
+    return material.length > 0 ? material.map(() => factory(colorHex, styleKey)) : factory(colorHex, styleKey);
+  }
+  if (isStyledRobotMaterial(material, colorHex, requireDoubleSide, styleKey)) {
+    return material;
+  }
+  disposeMaterialList(material);
+  return factory(colorHex, styleKey);
+}
+
 function applyRobotSolidColor(root, colorHex) {
-  root.traverse((c) => {
+  const styleKey = robotColorStyleKey(colorHex);
+  const receiveShadows = currentRobotPaletteSpec().receiveShadows !== false;
+  root?.traverse?.((c) => {
     if (c.isMesh) {
-      if (Array.isArray(c.material)) {
-        const oldMats = c.material;
-        oldMats.forEach((m) => m.dispose?.());
-        c.material = oldMats.map(() => createRobotSurfaceMaterial(colorHex));
-      } else {
-        c.material?.dispose?.();
-        c.material = createRobotSurfaceMaterial(colorHex);
-      }
+      c.material = ensureMaterial(
+        c.material,
+        colorHex,
+        true,
+        styleKey,
+        createRobotSurfaceMaterial
+      );
+      c.visible = true;
+      c.frustumCulled = false;
       c.castShadow = true;
-      c.receiveShadow = true;
+      c.receiveShadow = receiveShadows;
       return;
     }
     if (c.isLineSegments || c.isLine || c.isLineLoop) {
-      if (Array.isArray(c.material)) {
-        const oldMats = c.material;
-        oldMats.forEach((m) => m.dispose?.());
-        c.material = oldMats.map(() => createRobotLineMaterial(colorHex));
-      } else {
-        c.material?.dispose?.();
-        c.material = createRobotLineMaterial(colorHex);
-      }
+      c.material = ensureMaterial(
+        c.material,
+        colorHex,
+        false,
+        styleKey,
+        createRobotLineMaterial
+      );
+      c.visible = true;
+      c.frustumCulled = false;
       c.castShadow = false;
       c.receiveShadow = false;
     }
+  });
+}
+
+function refreshRobotSolidColors() {
+  robotMeshes.forEach((entry) => {
+    if (entry.playbackVisible === false) return;
+    if ((entry.materialStylePassesRemaining ?? 0) <= 0) return;
+    if (entry.mesh) applyRobotSolidColor(entry.mesh, entry.colorHex);
+    for (const root of uniqueRobotRoots(entry.urdfRobot, entry.collisionUrdfRobot)) {
+      applyRobotSolidColor(root, entry.colorHex);
+    }
+    entry.materialStylePassesRemaining--;
+  });
+}
+
+function applyRobotPaletteToScene() {
+  robotMeshes.forEach((entry, robotIndex) => {
+    const colorHex = robotColorHexForIndex(robotIndex);
+    entry.colorHex = colorHex;
+    entry.materialStylePassesRemaining = 120;
+    if (entry.mesh) applyRobotSolidColor(entry.mesh, colorHex);
+    for (const root of uniqueRobotRoots(entry.urdfRobot, entry.collisionUrdfRobot)) {
+      applyRobotSolidColor(root, colorHex);
+    }
+  });
+  if (showCrossSection2D) refreshCrossSection2D();
+}
+
+function setRobotColorPalette(paletteId) {
+  if (!ROBOT_COLOR_PALETTE_BY_ID.has(paletteId)) return;
+  selectedRobotPaletteId = paletteId;
+  if (playbackMode === "arc") {
+    robotMeshes.forEach((entry) => {
+      entry.colorHex = null;
+    });
+    updateRobotsForTimestep();
+  } else {
+    applyRobotPaletteToScene();
+  }
+}
+
+function initRobotPaletteSelect() {
+  const select = document.getElementById("palette-select");
+  if (!select) return;
+  select.innerHTML = "";
+  for (const palette of ROBOT_COLOR_PALETTES) {
+    const option = document.createElement("option");
+    option.value = palette.id;
+    option.textContent = palette.label;
+    select.appendChild(option);
+  }
+  select.value = selectedRobotPaletteId;
+  select.addEventListener("change", (event) => {
+    setRobotColorPalette(event.target.value);
   });
 }
 
@@ -1377,7 +1654,15 @@ function buildPlaceholderRobot(robot, colorHex) {
   const mesh = new THREE.Mesh(geom, createRobotSurfaceMaterial(colorHex));
   mesh.castShadow = true;
   mesh.receiveShadow = true;
-  return { mesh, robot, urdfRobot: null, colorHex };
+  return {
+    mesh,
+    robot,
+    urdfRobot: null,
+    colorHex,
+    playbackConfig: null,
+    playbackVisible: true,
+    materialStylePassesRemaining: 120,
+  };
 }
 
 /**
@@ -1444,39 +1729,343 @@ function uniqueRobotRoots(urdfRobot, collisionUrdfRobot) {
   return urdfRobot ? [urdfRobot] : [];
 }
 
+function applyRobotConfig(entry, cfg) {
+  const { mesh, robot, urdfRobot, collisionUrdfRobot } = entry;
+  entry.playbackConfig = cfg;
+  const pose = robot.base_pose || {
+    position: [0, 0, 0],
+    quaternion_xyzw: [0, 0, 0, 1],
+  };
+  const pos = pose.position || [0, 0, 0];
+  const q = pose.quaternion_xyzw || [0, 0, 0, 1];
+  if (urdfRobot) {
+    for (const root of uniqueRobotRoots(urdfRobot, collisionUrdfRobot)) {
+      root.position.set(pos[0], pos[1], pos[2]);
+      root.quaternion.set(q[0], q[1], q[2], q[3]);
+      applyJointConfig(root, robot, cfg);
+    }
+  } else if (mesh) {
+    if (robot.robot_type === "sphere" && cfg && cfg.length >= 3) {
+      mesh.position.set(cfg[0], cfg[1], cfg[2]);
+    } else {
+      mesh.position.set(pos[0], pos[1], pos[2]);
+    }
+    mesh.quaternion.set(q[0], q[1], q[2], q[3]);
+  }
+}
+
+function setRobotEntryColor(entry, colorHex) {
+  if (entry.colorHex === colorHex) return;
+  entry.colorHex = colorHex;
+  entry.materialStylePassesRemaining = 3;
+  if (entry.mesh) applyRobotSolidColor(entry.mesh, colorHex);
+  for (const root of uniqueRobotRoots(entry.urdfRobot, entry.collisionUrdfRobot)) {
+    applyRobotSolidColor(root, colorHex);
+  }
+}
+
+function updateSolutionPlayback() {
+  robotMeshes.forEach((entry, robotIndex) => {
+    entry.playbackVisible = true;
+    applyRobotConfig(entry, configAt(entry.robot, currentTimestep));
+    setRobotEntryColor(entry, robotColorHexForIndex(robotIndex));
+  });
+}
+
+function updateArcPlayback() {
+  const frame = arcTimeline[currentTimestep];
+  if (!frame) return;
+  const iteration =
+    resultData.arc_visualization.iterations[frame.iterationIndex];
+
+  if (frame.phase === "paths") {
+    robotMeshes.forEach((entry, robotIndex) => {
+      const firstConflict = firstReachedConflict(
+        iteration,
+        robotIndex,
+        frame.timestep
+      );
+      const robotTimestep = firstConflict
+        ? Number(firstConflict.timestep)
+        : frame.timestep;
+      entry.playbackVisible = true;
+      applyRobotConfig(
+        entry,
+        configAtPath(iteration.paths[robotIndex], robotTimestep)
+      );
+      setRobotEntryColor(
+        entry,
+        frame.solution
+          ? ARC_SOLUTION_COLOR
+          : firstConflict
+            ? ARC_CONFLICT_COLOR
+            : ARC_PATH_COLOR
+      );
+    });
+  } else {
+    robotMeshes.forEach((entry, robotIndex) => {
+      const repairIndex = iteration.repairs.findIndex((repair) =>
+        repair.robots.includes(robotIndex)
+      );
+      if (repairIndex < 0) {
+        entry.playbackVisible = false;
+        return;
+      }
+      const repair = iteration.repairs[repairIndex];
+      const robotPathIndex = repair.robots.indexOf(robotIndex);
+      entry.playbackVisible = true;
+      applyRobotConfig(
+        entry,
+        configAtPath(repair.paths[robotPathIndex], frame.timestep)
+      );
+      const colorIndex = Number.isInteger(repair.conflict_index)
+        ? repair.conflict_index
+        : repairIndex;
+      setRobotEntryColor(
+        entry,
+        ARC_GROUP_COLORS[colorIndex % ARC_GROUP_COLORS.length]
+      );
+    });
+  }
+
+}
+
 /**
- * Update robot poses for current timestep.
- * For sphere robots (robot_type === "sphere"), config [x,y,z] is the position.
+ * Update robot poses for the active playback mode.
  */
 function updateRobotsForTimestep() {
   if (!resultData) return;
-  robotMeshes.forEach(({ mesh, robot, urdfRobot, collisionUrdfRobot }) => {
-    const cfg = configAt(robot, currentTimestep);
-    const pose = robot.base_pose || { position: [0, 0, 0], quaternion_xyzw: [0, 0, 0, 1] };
-    const pos = pose.position || [0, 0, 0];
-    const q = pose.quaternion_xyzw || [0, 0, 0, 1];
-    if (urdfRobot) {
-      for (const root of uniqueRobotRoots(urdfRobot, collisionUrdfRobot)) {
-        root.position.set(pos[0], pos[1], pos[2]);
-        root.quaternion.set(q[0], q[1], q[2], q[3]);
-        applyJointConfig(root, robot, cfg);
-      }
-    } else {
-      // Sphere robots: config [x,y,z] is the world position
-      if (robot.robot_type === "sphere" && cfg && cfg.length >= 3) {
-        mesh.position.set(cfg[0], cfg[1], cfg[2]);
-      } else {
-        mesh.position.set(pos[0], pos[1], pos[2]);
-      }
-      mesh.quaternion.set(q[0], q[1], q[2], q[3]);
-    }
-  });
+  if (playbackMode === "arc") updateArcPlayback();
+  else updateSolutionPlayback();
+  applyRobotGeometryModeToScene();
   if (showCrossSection2D) refreshCrossSection2D();
 }
 
 /**
  * Update UI.
  */
+function playbackFrameCount() {
+  if (!resultData) return 0;
+  return playbackMode === "arc"
+    ? arcTimeline.length
+    : Math.max(0, Number(resultData.timesteps) || 0);
+}
+
+function clearArcLegend() {
+  const legend = document.getElementById("arc-legend");
+  if (legend) legend.replaceChildren();
+}
+
+function addArcLegendItem(colorHex, label) {
+  const legend = document.getElementById("arc-legend");
+  if (!legend) return;
+  const item = document.createElement("span");
+  item.className = "arc-legend-item";
+  const swatch = document.createElement("span");
+  swatch.className = "arc-swatch";
+  swatch.style.backgroundColor = `#${colorHex.toString(16).padStart(6, "0")}`;
+  const text = document.createElement("span");
+  text.textContent = label;
+  item.append(swatch, text);
+  legend.appendChild(item);
+}
+
+function updateArcStageBox(frame) {
+  const box = document.getElementById("arc-stage-box");
+  const label = document.getElementById("arc-stage-label");
+  if (!box || !label) return;
+
+  if (playbackMode !== "arc" || !frame) {
+    box.hidden = true;
+    return;
+  }
+
+  const complete = frame.solution === true;
+  const resolving = !complete && frame.phase === "repairs";
+  label.textContent = complete
+    ? "Complete"
+    : resolving
+      ? "Conflict Resolution"
+      : "Conflict Detection";
+  label.classList.toggle("conflict-detection", !complete && !resolving);
+  label.classList.toggle("conflict-resolution", resolving);
+  label.classList.toggle("complete", complete);
+  box.hidden = false;
+}
+
+function initArcStageBox() {
+  const box = document.getElementById("arc-stage-box");
+  if (!box) return;
+
+  const toolbar = document.getElementById("toolbar");
+  const initialTop = Math.max(12, (toolbar?.getBoundingClientRect().bottom || 0) + 12);
+  box.style.left = "12px";
+  box.style.top = `${initialTop}px`;
+
+  let drag = null;
+  const clampPosition = (left, top) => ({
+    left: Math.max(0, Math.min(left, window.innerWidth - box.offsetWidth)),
+    top: Math.max(0, Math.min(top, window.innerHeight - box.offsetHeight)),
+  });
+
+  box.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = box.getBoundingClientRect();
+    drag = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+    };
+    box.setPointerCapture(event.pointerId);
+  });
+
+  box.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const position = clampPosition(
+      event.clientX - drag.offsetX,
+      event.clientY - drag.offsetY
+    );
+    box.style.left = `${position.left}px`;
+    box.style.top = `${position.top}px`;
+  });
+
+  const finishDrag = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    drag = null;
+    if (box.hasPointerCapture(event.pointerId)) {
+      box.releasePointerCapture(event.pointerId);
+    }
+  };
+  box.addEventListener("pointerup", finishDrag);
+  box.addEventListener("pointercancel", finishDrag);
+
+  window.addEventListener("resize", () => {
+    if (box.hidden) return;
+    const rect = box.getBoundingClientRect();
+    const position = clampPosition(rect.left, rect.top);
+    box.style.left = `${position.left}px`;
+    box.style.top = `${position.top}px`;
+  });
+}
+
+function updateArcPanel() {
+  const panel = document.getElementById("arc-panel");
+  const stage = document.getElementById("arc-stage");
+  const detail = document.getElementById("arc-detail");
+  if (!panel || !stage || !detail) return;
+  if (playbackMode !== "arc" || arcTimeline.length === 0) {
+    panel.hidden = true;
+    updateArcStageBox(null);
+    clearArcLegend();
+    return;
+  }
+
+  panel.hidden = false;
+  clearArcLegend();
+  const frame = arcTimeline[currentTimestep];
+  updateArcStageBox(frame);
+  const iteration =
+    resultData.arc_visualization.iterations[frame.iterationIndex];
+  const roundLabel =
+    `Round ${frame.iterationIndex + 1} of ` +
+    `${resultData.arc_visualization.iterations.length}`;
+  const planner = resultData.arc_visualization.planner || resultData.solver || "ARC";
+
+  if (frame.phase === "paths") {
+    if (frame.solution) {
+      stage.textContent = `${planner} · ${roundLabel} · Solution found`;
+      detail.textContent =
+        `No conflicts in the complete path set · path timestep ` +
+        `${frame.timestep} of ${frame.phaseEnd}`;
+      addArcLegendItem(ARC_SOLUTION_COLOR, "valid solution");
+      return;
+    }
+
+    stage.textContent = `${planner} · ${roundLabel} · Conflict detection`;
+    if (!iteration.conflict_scan_completed) {
+      detail.textContent =
+        `Saved path set · path timestep ${frame.timestep} of ${frame.phaseEnd} · ` +
+        `conflict scan did not complete`;
+      addArcLegendItem(ARC_PATH_COLOR, "unchecked path");
+      return;
+    }
+
+    const reached = iteration.conflicts.filter(
+      (conflict) => Number(conflict.timestep) <= frame.timestep
+    ).length;
+    const conflictPauseTimesteps = arcFrameDurationTimesteps(
+      resultData,
+      frame,
+      playbackSpeedMultiplier
+    );
+    const conflictPause =
+      conflictPauseTimesteps > 1
+        ? ` · paused for ${fmtNum(conflictPauseTimesteps, 2)} playback steps`
+        : "";
+    detail.textContent =
+      `Path timestep ${frame.timestep} of ${frame.phaseEnd} · ` +
+      `${reached} of ${iteration.conflicts.length} conflicts reached` +
+      conflictPause;
+    addArcLegendItem(ARC_PATH_COLOR, "advancing");
+    iteration.conflicts.forEach((conflict, conflictIndex) => {
+      addArcLegendItem(
+        ARC_CONFLICT_COLOR,
+        `C${conflictIndex + 1}: robots ${conflictRobots(conflict).join(", ")} ` +
+          `at t=${conflict.timestep}`
+      );
+    });
+    return;
+  }
+
+  const workerCount = resultData.arc_visualization.workers || 1;
+  stage.textContent =
+    `${planner} · ${roundLabel} · ` +
+    `${workerCount > 1 ? "Parallel local repair" : "Local repair"}`;
+  detail.textContent =
+    `Local step ${frame.timestep} of ${frame.phaseEnd} · ` +
+    `${iteration.repairs.length} subproblem` +
+    `${iteration.repairs.length === 1 ? "" : "s"} · ${workerCount} worker` +
+    `${workerCount === 1 ? "" : "s"}`;
+  iteration.repairs.forEach((repair, repairIndex) => {
+    const colorIndex = Number.isInteger(repair.conflict_index)
+      ? repair.conflict_index
+      : repairIndex;
+    addArcLegendItem(
+      ARC_GROUP_COLORS[colorIndex % ARC_GROUP_COLORS.length],
+      `C${colorIndex + 1}: robots ${repair.robots.join(", ")}`
+    );
+  });
+}
+
+function syncPlaybackModeControl() {
+  if (!playbackModeSelectEl) return;
+  const arcOption = playbackModeSelectEl.querySelector('option[value="arc"]');
+  if (arcOption) arcOption.disabled = arcTimeline.length === 0;
+  playbackModeSelectEl.value = playbackMode;
+  const paletteSelect = document.getElementById("palette-select");
+  if (paletteSelect) paletteSelect.disabled = playbackMode === "arc";
+}
+
+function stopPlayback() {
+  isPlaying = false;
+  if (playTimerId !== null) clearTimeout(playTimerId);
+  playTimerId = null;
+}
+
+function setPlaybackMode(mode) {
+  const nextMode = mode === "arc" && arcTimeline.length > 0 ? "arc" : "solution";
+  stopPlayback();
+  playbackMode = nextMode;
+  currentTimestep = 0;
+  syncPlaybackModeControl();
+  updateRobotsForTimestep();
+  updateUI();
+}
+
 function updateUI() {
   if (!resultData) {
     if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
@@ -1485,20 +2074,29 @@ function updateUI() {
       playPauseBtn.disabled = true;
     }
     if (sliderEl) sliderEl.disabled = true;
+    updateArcPanel();
+    syncPlaybackModeControl();
     syncCrossSectionToggleButton();
     return;
   }
-  const maxT = Math.max(0, resultData.timesteps - 1);
-  if (timestepEl) timestepEl.textContent = `Timestep ${currentTimestep} / ${maxT}`;
+  const frameCount = playbackFrameCount();
+  const maxT = Math.max(0, frameCount - 1);
+  if (timestepEl) {
+    timestepEl.textContent = playbackMode === "arc"
+      ? `Frame ${currentTimestep + 1} / ${Math.max(1, frameCount)}`
+      : `Timestep ${currentTimestep} / ${maxT}`;
+  }
   if (sliderEl) {
-    sliderEl.disabled = false;
+    sliderEl.disabled = frameCount <= 1;
     sliderEl.value = currentTimestep;
     sliderEl.max = maxT;
   }
   if (playPauseBtn) {
-    playPauseBtn.disabled = maxT <= 0;
+    playPauseBtn.disabled = frameCount <= 1;
     playPauseBtn.textContent = isPlaying ? "Pause" : "Play";
   }
+  syncPlaybackModeControl();
+  updateArcPanel();
   syncCrossSectionToggleButton();
 }
 
@@ -1507,7 +2105,7 @@ function updateUI() {
  */
 function setTimestep(t) {
   if (!resultData) return;
-  const maxT = Math.max(0, resultData.timesteps - 1);
+  const maxT = Math.max(0, playbackFrameCount() - 1);
   currentTimestep = Math.max(0, Math.min(t, maxT));
   updateRobotsForTimestep();
   updateUI();
@@ -1520,25 +2118,55 @@ function step(delta) {
   setTimestep(currentTimestep + delta);
 }
 
+function currentFrameDurationTimesteps() {
+  if (playbackMode !== "arc") return 1;
+  return arcFrameDurationTimesteps(
+    resultData,
+    arcTimeline[currentTimestep],
+    playbackSpeedMultiplier
+  );
+}
+
+function currentPlaybackDelayMs() {
+  return (
+    (1000 * currentFrameDurationTimesteps()) /
+    (PLAY_FPS * playbackSpeedMultiplier)
+  );
+}
+
+function scheduleNextPlaybackStep() {
+  if (!isPlaying) return;
+  playTimerId = setTimeout(() => {
+    playTimerId = null;
+    if (!isPlaying) return;
+    if (currentTimestep >= playbackFrameCount() - 1) {
+      stopPlayback();
+      updateUI();
+      return;
+    }
+    step(1);
+    scheduleNextPlaybackStep();
+  }, currentPlaybackDelayMs());
+}
+
+function restartPlaybackTimer() {
+  if (!isPlaying) return;
+  if (playTimerId !== null) clearTimeout(playTimerId);
+  playTimerId = null;
+  scheduleNextPlaybackStep();
+}
+
 /**
  * Toggle play/pause.
  */
 function togglePlay() {
+  if (playbackFrameCount() <= 1) return;
   isPlaying = !isPlaying;
   if (isPlaying) {
-    playIntervalId = setInterval(() => {
-      if (currentTimestep >= resultData.timesteps - 1) {
-        isPlaying = false;
-        if (playIntervalId) clearInterval(playIntervalId);
-      } else {
-        step(1);
-      }
-    }, 1000 / PLAY_FPS);
+    scheduleNextPlaybackStep();
   } else {
-    if (playIntervalId) {
-      clearInterval(playIntervalId);
-      playIntervalId = null;
-    }
+    if (playTimerId !== null) clearTimeout(playTimerId);
+    playTimerId = null;
   }
   updateUI();
 }
@@ -1562,7 +2190,7 @@ function onKeyDown(e) {
       e.preventDefault();
       break;
     case "End":
-      setTimestep(resultData.timesteps - 1);
+      setTimestep(playbackFrameCount() - 1);
       e.preventDefault();
       break;
     case "Space":
@@ -1594,17 +2222,21 @@ function initScene() {
   controls.staticMoving = false;
   controls.dynamicDampingFactor = 0.05;
 
-  ambientLight = new THREE.AmbientLight(0xffffff, 0.22);
+  ambientLight = new THREE.AmbientLight(0xffffff, 0.38);
   scene.add(ambientLight);
 
-  sunLight = new THREE.DirectionalLight(0xffffff, 1.05);
-  sunLight.position.set(0, 0, 100);
+  hemisphereLight = new THREE.HemisphereLight(0xffffff, 0xffffff, 0.48);
+  scene.add(hemisphereLight);
+
+  sunLight = new THREE.DirectionalLight(0xffffff, 1.15);
+  sunLight.position.set(60, -80, 120);
   sunLight.target.position.set(0, 0, 0);
   scene.add(sunLight.target);
   scene.add(sunLight);
   sunLight.castShadow = true;
   sunLight.shadow.mapSize.set(2048, 2048);
   sunLight.shadow.bias = -0.00015;
+  sunLight.shadow.normalBias = 0.015;
   const sc = sunLight.shadow.camera;
   sc.near = 0.5;
   sc.far = 220;
@@ -1613,6 +2245,20 @@ function initScene() {
   sc.top = 10;
   sc.bottom = -10;
   sc.updateProjectionMatrix();
+
+  fillLight = new THREE.DirectionalLight(0xffffff, 0.72);
+  fillLight.position.set(-80, 55, 75);
+  fillLight.target.position.set(0, 0, 0);
+  scene.add(fillLight.target);
+  scene.add(fillLight);
+  fillLight.castShadow = false;
+
+  rimLight = new THREE.DirectionalLight(0xe8fbff, 0.42);
+  rimLight.position.set(-50, -90, 95);
+  rimLight.target.position.set(0, 0, 0);
+  scene.add(rimLight.target);
+  scene.add(rimLight);
+  rimLight.castShadow = false;
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -1627,24 +2273,34 @@ function initScene() {
 function syncLightingToggleButton() {
   const btn = document.getElementById("lighting-toggle");
   if (!btn) return;
-  btn.textContent = lightingKeyMode ? "Key + ambient" : "Ambient only";
+  btn.textContent = lightingKeyMode ? "Key + fill" : "Ambient only";
   btn.title = lightingKeyMode
-    ? "Directional sun + dim ambient (shadows on). Click for ambient-only fill."
-    : "Even ambient, directional off. Click to restore key light + shadows.";
+    ? "Angled key, broad fill, and shadows. Click for ambient-only lighting."
+    : "Even ambient lighting. Click to restore key, fill, and shadows.";
 }
 
 function applyLightingMode() {
-  if (!ambientLight || !sunLight) return;
+  if (!ambientLight || !hemisphereLight || !sunLight || !fillLight || !rimLight) return;
   if (lightingKeyMode) {
-    ambientLight.intensity = 0.22;
-    sunLight.intensity = 1.05;
+    ambientLight.intensity = 0.38;
+    hemisphereLight.intensity = 0.48;
+    sunLight.intensity = 1.15;
     sunLight.visible = true;
     sunLight.castShadow = true;
+    fillLight.intensity = 0.72;
+    fillLight.visible = true;
+    rimLight.intensity = 0.42;
+    rimLight.visible = true;
   } else {
-    ambientLight.intensity = 0.92;
+    ambientLight.intensity = 1.15;
+    hemisphereLight.intensity = 0.18;
     sunLight.intensity = 0;
     sunLight.visible = false;
     sunLight.castShadow = false;
+    fillLight.intensity = 0;
+    fillLight.visible = false;
+    rimLight.intensity = 0;
+    rimLight.visible = false;
   }
 }
 
@@ -1658,15 +2314,41 @@ function withTrailingSlash(url) {
   return url.endsWith("/") ? url : `${url}/`;
 }
 
-function robotVisualUrdfPath(robot) {
+function rawRobotVisualUrdfPath(robot) {
   return robot.visual_urdf_path || robot.urdf_path || "";
+}
+
+function isPandaRobot(robot) {
+  const type = String(robot.robot_type || "").toLowerCase();
+  const path = String(rawRobotVisualUrdfPath(robot)).toLowerCase();
+  return type === "panda" || path.includes("/panda/");
+}
+
+function isPandaSpherizedUrdf(path) {
+  const normalized = String(path || "").replace(/\\/g, "/").toLowerCase();
+  return normalized === "panda/panda_spherized.urdf" ||
+    normalized.endsWith("/panda/panda_spherized.urdf");
+}
+
+function robotVisualUrdfCandidates(robot) {
+  const path = rawRobotVisualUrdfPath(robot);
+  if (!path) return [];
+  const candidates =
+    isPandaRobot(robot) && isPandaSpherizedUrdf(path)
+      ? [DEFAULT_PANDA_VISUAL_URDF_PATH, path]
+      : [path];
+  return candidates.filter((candidate, index) => candidates.indexOf(candidate) === index);
+}
+
+function robotVisualUrdfPath(robot) {
+  return robotVisualUrdfCandidates(robot)[0] || "";
 }
 
 function robotCollisionUrdfPath(robot) {
   if (robot.collision_urdf_path) return robot.collision_urdf_path;
   if (robot.planning_urdf_path) return robot.planning_urdf_path;
 
-  const visualPath = robotVisualUrdfPath(robot);
+  const visualPath = rawRobotVisualUrdfPath(robot);
   const lowerType = String(robot.robot_type || "").toLowerCase();
   const lowerPath = String(visualPath || "").toLowerCase();
   const isPlanar3 = lowerType === "planar3" || lowerPath.includes("planar3");
@@ -1680,7 +2362,13 @@ function robotCollisionUrdfPath(robot) {
 }
 
 function assetUrl(assetBase, path) {
-  return /^https?:\/\//i.test(path) ? path : new URL(path, assetBase).href;
+  const url = /^https?:\/\//i.test(path) ? new URL(path) : new URL(path, assetBase);
+  const normalizedPath = url.pathname.replace(/\\/g, "/").toLowerCase();
+  if (normalizedPath.endsWith("/panda/panda.urdf") ||
+      normalizedPath.endsWith("/panda/panda_spherized.urdf")) {
+    url.searchParams.set("assetRevision", PANDA_RESOURCE_REVISION);
+  }
+  return url.href;
 }
 
 /**
@@ -1728,27 +2416,62 @@ async function waitForUrdfMeshCallbacks(getPending, timeoutMs = 120000) {
 }
 
 /**
- * Load URDF, wait until async mesh files finish populating the tree, then apply solid color.
+ * Load URDF, wait until async mesh files finish populating the tree, then apply robot color.
  * URDFLoader's load() resolves after parse; geometry is added in mesh load callbacks later.
  */
-async function loadUrdfRobotWithSolidColor(assetBase, urdfUrl, colorHex) {
-  const loader = createURDFLoader(assetBase);
+async function loadUrdfRobotWithSolidColor(assetBase, urdfUrl, colorHex, geometryKind) {
+  const loader = createURDFLoader(assetBase, colorHex);
   const getPending =
     typeof loader.getPendingMeshLoads === "function"
       ? () => loader.getPendingMeshLoads()
       : () => 0;
-  const urdfRobot = await loadURDFAsync(loader, urdfUrl);
+  const urdfRobot = await loadURDFAsync(loader, urdfUrl, {
+    parseVisual: geometryKind === "visual",
+    parseCollision: geometryKind === "collision",
+  });
   await waitForUrdfMeshCallbacks(getPending);
   applyRobotSolidColor(urdfRobot, colorHex);
   setUrdfRobotGeometryVisibility(urdfRobot, showRobotCollisionGeometry);
+  const geometrySummary = summarizeUrdfGeometry(urdfRobot);
+  urdfRobot.userData.comotionGeometrySummary = geometrySummary;
+  console.info(
+    "[viewer] Loaded URDF geometry",
+    urdfUrl,
+    JSON.stringify(geometrySummary)
+  );
   return urdfRobot;
+}
+
+async function loadFirstUrdfRobotWithSolidColor(assetBase, urdfPaths, colorHex) {
+  let firstError = null;
+  for (const urdfPath of urdfPaths) {
+    try {
+      const urdfUrl = assetUrl(assetBase, urdfPath);
+      return {
+        urdfPath,
+        urdfRobot: await loadUrdfRobotWithSolidColor(
+          assetBase,
+          urdfUrl,
+          colorHex,
+          "visual"
+        ),
+      };
+    } catch (err) {
+      if (!firstError) firstError = err;
+      console.warn("[viewer] URDF load failed for", urdfPath, err);
+    }
+  }
+  throw firstError || new Error("No URDF paths available");
 }
 
 /**
  * Load result and build scene. Loads URDFs when urdf_path is present.
  */
 async function loadResult(data) {
+  stopPlayback();
   resultData = data;
+  arcTimeline = buildArcTimeline(data);
+  playbackMode = arcTimeline.length > 0 ? "arc" : "solution";
   currentTimestep = 0;
 
   // Panda-flat scenes are compact and heavily overlapping. Prefer the
@@ -1777,25 +2500,37 @@ async function loadResult(data) {
 
   const assetBase = getAssetBaseUrl();
 
-  for (const robot of data.robots) {
-    const robotColor = randomRobotColorHex();
-    const urdfPath = robotVisualUrdfPath(robot);
+  for (const [robotIndex, robot] of data.robots.entries()) {
+    const robotColor = robotColorHexForIndex(robotIndex);
+    const urdfPaths = robotVisualUrdfCandidates(robot);
     const collisionUrdfPath = robotCollisionUrdfPath(robot);
-    if (urdfPath) {
+    if (urdfPaths.length > 0) {
       try {
-        const urdfUrl = assetUrl(assetBase, urdfPath);
-        const urdfRobot = await loadUrdfRobotWithSolidColor(assetBase, urdfUrl, robotColor);
+        const { urdfPath, urdfRobot } = await loadFirstUrdfRobotWithSolidColor(
+          assetBase,
+          urdfPaths,
+          robotColor
+        );
+        if (urdfPath !== rawRobotVisualUrdfPath(robot)) {
+          console.info(
+            "[viewer] Using panda visual URDF",
+            urdfPath,
+            "for",
+            robot.name || robot.robot_type
+          );
+        }
         let collisionUrdfRobot = null;
-        if (collisionUrdfPath && collisionUrdfPath !== urdfPath) {
+        if (collisionUrdfPath) {
           try {
             const collisionUrl = assetUrl(assetBase, collisionUrdfPath);
             collisionUrdfRobot = await loadUrdfRobotWithSolidColor(
               assetBase,
               collisionUrl,
-              robotColor
+              robotColor,
+              "collision"
             );
             console.info(
-              "[viewer] Loaded separate collision URDF for",
+              "[viewer] Loaded collision-only geometry for",
               robot.name || robot.robot_type,
               collisionUrdfPath
             );
@@ -1814,12 +2549,15 @@ async function loadResult(data) {
           urdfRobot,
           collisionUrdfRobot,
           colorHex: robotColor,
+          playbackConfig: null,
+          playbackVisible: true,
+          materialStylePassesRemaining: 120,
         });
         scene.add(urdfRobot);
         if (collisionUrdfRobot) scene.add(collisionUrdfRobot);
         applyRobotGeometryModeToScene();
       } catch (err) {
-        console.warn("URDF load failed for", urdfPath, err);
+        console.warn("URDF load failed for", urdfPaths, err);
         const ph = buildPlaceholderRobot(robot, robotColor);
         robotMeshes.push(ph);
         scene.add(ph.mesh);
@@ -1888,6 +2626,7 @@ function animate() {
   requestAnimationFrame(animate);
   controls.update();
   syncCameraInputsFromOrbit();
+  refreshRobotSolidColors();
   renderer.render(scene, camera);
 }
 
@@ -1897,11 +2636,15 @@ function animate() {
 function init() {
   initScene();
   initCameraPanel();
+  initArcStageBox();
   syncCameraInputsFromOrbit();
 
   timestepEl = document.getElementById("timestep");
   playPauseBtn = document.getElementById("play-pause");
   sliderEl = document.getElementById("timestep-slider");
+  playbackModeSelectEl = document.getElementById("playback-mode-select");
+  playbackSpeedSelectEl = document.getElementById("playback-speed-select");
+  initRobotPaletteSelect();
 
   document.getElementById("file-input").addEventListener("change", (e) => {
     const f = e.target.files[0];
@@ -1912,6 +2655,24 @@ function init() {
   });
 
   if (playPauseBtn) playPauseBtn.addEventListener("click", togglePlay);
+
+  if (playbackModeSelectEl) {
+    playbackModeSelectEl.addEventListener("change", (event) => {
+      setPlaybackMode(event.target.value);
+    });
+  }
+
+  if (playbackSpeedSelectEl) {
+    playbackSpeedMultiplier =
+      Number(playbackSpeedSelectEl.value) || playbackSpeedMultiplier;
+    playbackSpeedSelectEl.addEventListener("change", (event) => {
+      const nextSpeed = Number(event.target.value);
+      if (!Number.isFinite(nextSpeed) || nextSpeed <= 0) return;
+      playbackSpeedMultiplier = nextSpeed;
+      updateUI();
+      restartPlaybackTimer();
+    });
+  }
 
   if (sliderEl) {
     sliderEl.addEventListener("input", (e) => setTimestep(parseInt(e.target.value, 10)));

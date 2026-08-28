@@ -138,6 +138,12 @@ if(COMOTION_BUILD_TESTS)
     add_test(NAME composite_rrt_endpoint_regression
              COMMAND composite_rrt_endpoint_regression)
 
+    add_executable(composite_rrt_seed_regression
+        tests/composite_rrt_seed_regression.cpp)
+    target_link_libraries(composite_rrt_seed_regression PRIVATE comotion)
+    add_test(NAME composite_rrt_seed_regression
+             COMMAND composite_rrt_seed_regression)
+
     add_executable(composite_rrtstar_regression
         tests/composite_rrtstar_regression.cpp)
     target_link_libraries(composite_rrtstar_regression PRIVATE comotion)
@@ -204,6 +210,12 @@ if(COMOTION_BUILD_TESTS)
     target_link_libraries(or_parallel_planner_regression PRIVATE comotion)
     add_test(NAME or_parallel_planner_regression
              COMMAND or_parallel_planner_regression)
+
+    add_executable(benchmark_app_options_regression
+        tests/benchmark_app_options_regression.cpp)
+    target_link_libraries(benchmark_app_options_regression PRIVATE comotion)
+    add_test(NAME benchmark_app_options_regression
+             COMMAND benchmark_app_options_regression)
 
     add_executable(stcbs_regression
         tests/stcbs_regression.cpp)
@@ -288,6 +300,10 @@ install(PROGRAMS
     benchmarks/scripts/run_feasibility.py
     benchmarks/scripts/run_anytime.py
     benchmarks/scripts/run_multicore.py
+    benchmarks/scripts/run_parallel_arc_2d.py
+    benchmarks/scripts/run_parallel_arc_panda.py
+    benchmarks/scripts/run_parallel_arc_conflict_ablation.py
+    benchmarks/scripts/run_parallel_arc_optimistic_ablation.py
     benchmarks/scripts/plot_results.py
     benchmarks/scripts/run_planner_trials.py
     benchmarks/scripts/run_param_sweep.py
@@ -343,6 +359,7 @@ set(CPACK_SOURCE_IGNORE_FILES
   "/benchmarks/configs/panda_cage_n8_arc_(custom|expansion|exponential|initial|linear|log|tuning).*\\\\.json$"
   "/benchmarks/scripts/.*_07_.*\\\\.py$"
   "/benchmarks/scripts/run_.*_campaign_.*\\\\.py$"
+  "/benchmarks/scripts/(analyze_parallel_arc_repair_or_trace|package_new_parc_results|recover_parc_final_8_20|run_2d_va_profile_parallel_arc|run_arc_panda_n8_parallel_defaults_15jobs|run_parallel_arc_refresh_30seed|run_parallel_arc_reproduction|verify_final_results_8_19_2026|verify_parallel_arc_refresh_30seed)\\\\.py$"
   "/benchmarks/scripts/analyze_arc_conflict_timings\\\\.py$"
   "/benchmarks/scripts/export_validation_chunk_csv\\\\.py$"
   "/benchmarks/scripts/plot_arc_runtime_.*\\\\.py$"

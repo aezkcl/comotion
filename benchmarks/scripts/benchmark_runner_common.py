@@ -4,11 +4,13 @@ import csv
 import json
 import math
 import os
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +34,24 @@ else:
     DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
 _MPL_CACHE_DIR = None
 _CSV_WRITE_LOCK = threading.Lock()
+PARALLEL_ARC_ASSIGNMENT_FLAG = "--parallel-arc-conflict-find-assignment"
+DEFAULT_PARALLEL_ARC_CONFLICT_FIND_ASSIGNMENT = "cyclic_cover_greedy"
+
+
+def effective_variant_extra_args(variant: "PlannerVariant") -> tuple[str, ...]:
+    """Return launch arguments with the benchmark P-ARC defaults applied."""
+    has_assignment = any(
+        arg == PARALLEL_ARC_ASSIGNMENT_FLAG
+        or arg.startswith(f"{PARALLEL_ARC_ASSIGNMENT_FLAG}=")
+        for arg in variant.extra_args
+    )
+    if variant.algorithm != "parallel_arc" or has_assignment:
+        return variant.extra_args
+    return (
+        PARALLEL_ARC_ASSIGNMENT_FLAG,
+        DEFAULT_PARALLEL_ARC_CONFLICT_FIND_ASSIGNMENT,
+        *variant.extra_args,
+    )
 
 
 @dataclass(frozen=True)
@@ -89,7 +109,7 @@ class TrialSpec:
             if self.task_index is None:
                 raise RuntimeError(f"{self.case.key} requires a task index")
             command.extend(["--task-index", str(self.task_index)])
-        command.extend(self.variant.extra_args)
+        command.extend(effective_variant_extra_args(self.variant))
         return command
 
 
@@ -687,6 +707,8 @@ def paper_conflict_horizon_variants() -> list[PlannerVariant]:
                 "--parallel-arc-worker-processes",
                 str(PAPER_PARALLEL_ARC_TOTAL_WORKERS),
                 "--parallel-arc-initial-solution-or",
+                PARALLEL_ARC_ASSIGNMENT_FLAG,
+                "round_robin",
                 "--parallel-arc-conflict-find-horizon",
                 str(horizon),
                 "--parallel-arc-conflict-ablation-only",
@@ -836,6 +858,93 @@ def metrics_output_path(spec: TrialSpec) -> Path:
     )
 
 
+def run_command_with_process_group_timeout(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float | None,
+) -> tuple[int | None, bool]:
+    """Run one trial and terminate its complete process tree on timeout.
+
+    Parallel planners fork worker processes.  ``subprocess.run(timeout=...)``
+    kills only the immediate app process, allowing its workers to become
+    orphans and consume resources during later trials.  A fresh POSIX session
+    gives every trial its own process group that can be terminated as a unit.
+    """
+    process = subprocess.Popen(
+        list(command),
+        cwd=RUNTIME_CWD,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=(os.name == "posix"),
+    )
+    def process_group_exists() -> bool:
+        if os.name != "posix":
+            return process.poll() is None
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def wait_for_process_group_exit(seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while process_group_exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not process_group_exists()
+
+    def ensure_process_group_cleanup() -> None:
+        if wait_for_process_group_exit(0.25):
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        else:
+            process.terminate()
+        if wait_for_process_group_exit(1.0):
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        else:
+            process.kill()
+        if not wait_for_process_group_exit(1.0):
+            raise RuntimeError(
+                f"trial process group {process.pid} did not terminate"
+            )
+
+    try:
+        process.communicate(timeout=timeout_seconds)
+        ensure_process_group_cleanup()
+        return process.returncode, False
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
+
+        try:
+            process.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.communicate()
+        ensure_process_group_cleanup()
+        return None, True
+
+
 def run_trial(
     spec: TrialSpec,
     timeout_seconds: float | None,
@@ -851,19 +960,9 @@ def run_trial(
 
         timed_out = False
         returncode: int | None
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=RUNTIME_CWD,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            returncode = completed.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            returncode = None
+        returncode, timed_out = run_command_with_process_group_timeout(
+            command, timeout_seconds=timeout_seconds
+        )
 
         metrics = load_json(metrics_path)
         result_row = build_result_row(
@@ -882,19 +981,9 @@ def run_trial(
 
         timed_out = False
         returncode: int | None
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=RUNTIME_CWD,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
-            returncode = completed.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            returncode = None
+        returncode, timed_out = run_command_with_process_group_timeout(
+            command, timeout_seconds=timeout_seconds
+        )
 
         metrics = load_json(metrics_path)
 
@@ -1344,7 +1433,7 @@ def write_manifest(
             {
                 "label": variant.label,
                 "algorithm": variant.algorithm,
-                "extra_args": list(variant.extra_args),
+                "extra_args": list(effective_variant_extra_args(variant)),
             }
             for variant in variants
         ],

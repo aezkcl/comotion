@@ -26,6 +26,7 @@ public:
     std::string name() const override { return "ParallelARC"; }
 
     void setWorkerProcesses(unsigned n) { worker_processes_ = n; }
+    unsigned workerProcesses() const { return worker_processes_; }
     void setParallelizeInitialIndividualPlans(bool enabled) {
         parallelize_initial_individual_plans_ = enabled;
     }
@@ -44,6 +45,10 @@ public:
     }
     void setConflictFindHorizon(std::size_t horizon) {
         conflict_find_horizon_ = horizon;
+    }
+    void setConflictFindParallelAssignment(
+        ConflictFindParallelAssignment assignment) {
+        conflict_find_parallel_assignment_ = assignment;
     }
     void setConflictBatchMode(InterRobotConflictBatchMode mode) {
         conflict_batch_mode_ = mode;
@@ -137,6 +142,8 @@ private:
     ParallelArcConflictFindMode conflict_find_mode_ =
         ParallelArcConflictFindMode::SegmentParallel;
     std::size_t conflict_find_horizon_ = 400;
+    ConflictFindParallelAssignment conflict_find_parallel_assignment_ =
+        ConflictFindParallelAssignment::Auto;
     InterRobotConflictBatchMode conflict_batch_mode_ =
         InterRobotConflictBatchMode::OptimisticIndependent;
     bool repair_duplicate_attempts_ = true;

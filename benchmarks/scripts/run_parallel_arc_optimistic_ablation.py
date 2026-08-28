@@ -16,7 +16,9 @@ sys.dont_write_bytecode = True
 from benchmark_runner_common import (
     CASE_CATALOG,
     DEFAULT_BUILD_DIR,
+    DEFAULT_PARALLEL_ARC_CONFLICT_FIND_ASSIGNMENT,
     DEFAULT_RESULTS_DIR,
+    PlannerVariant,
     build_trial_specs,
     finish_outputs,
     paper_optimistic_conflict_ablation_variants,
@@ -42,6 +44,56 @@ SUMMARY_COLUMNS = [
 PAPER_TASK_INDICES = (0, 1, 2, 3, 4)
 PAPER_SEED_COUNT = 10
 PAPER_TIME_LIMIT_SECONDS = 100.0
+
+# Keep the optimistic-independence comparison pinned to the Panda Cage ARC
+# profile used by the current P-ARC experiments.  These are deliberately
+# command-line arguments rather than inherited executable defaults so the
+# manifest records the effective experimental configuration and later default
+# changes cannot silently alter the ablation.
+PANDA_ARC_PROFILE_ARGS = (
+    "--arc-initial-window",
+    "20",
+    "--arc-expansion-step",
+    "1.05",
+    "--arc-expansion-policy",
+    "exponential",
+    "--arc-initial-valid-expansion-policy",
+    "linear",
+    "--arc-initial-valid-expansion-step",
+    "20",
+    "--arc-initial-valid-asymmetric-expansion",
+    "--arc-cspace-bound-margin",
+    "2",
+    "--arc-min-cspace-bound-range",
+    "2",
+    "--arc-simplification-max-shortcut-steps",
+    "128",
+    "--arc-simplification-max-empty-steps",
+    "32",
+    "--arc-simplification-max-smooth-steps",
+    "1",
+    "--arc-simplification-max-passes",
+    "1",
+    "--arc-local-composite-max-samples",
+    "250000",
+    "--arc-local-composite-use-makespan-metric",
+    "--arc-simplify-initial-solutions",
+    "--no-arc-simplify-conflict-solutions",
+    "--arc-local-solvers",
+    "composite",
+    "--arc-local-prioritized-max-iterations",
+    "10",
+    "--parallel-arc-parallel-initial-plans",
+    "--parallel-arc-repair-duplicate-attempts",
+    "--parallel-arc-strategy",
+    "synchronous",
+    "--parallel-arc-conflict-strategy",
+    "greedy",
+    "--parallel-arc-conflict-find-mode",
+    "segment_parallel",
+    "--parallel-arc-conflict-find-horizon",
+    "200",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -260,6 +312,8 @@ def write_summary(path: Path, rows: Sequence[dict[str, Any]]) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.jobs != 1:
+        raise RuntimeError("The final campaign requires --jobs 1")
     output_root = (
         args.output_root
         if args.output_root is not None
@@ -292,7 +346,15 @@ def main() -> int:
                 "timeout; pass --allow-nonpaper-matrix for a diagnostic run"
             )
     case = CASE_CATALOG["panda_cage_n8"]
-    variants = paper_optimistic_conflict_ablation_variants()
+    variants = [
+        PlannerVariant(
+            label=variant.label,
+            algorithm=variant.algorithm,
+            slug=variant.slug,
+            extra_args=(*PANDA_ARC_PROFILE_ARGS, *variant.extra_args),
+        )
+        for variant in paper_optimistic_conflict_ablation_variants()
+    ]
     specs = build_trial_specs(
         cases=[case],
         variants=variants,
@@ -315,6 +377,33 @@ def main() -> int:
         print(f"summary_csv: {summary_csv_path}")
         return 0
 
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "experiment_config.json").write_text(
+        json.dumps(
+            {
+                "schema": "comotion.parallel_arc_optimistic_ablation.v1",
+                "seeds": seeds,
+                "task_indices": task_indices,
+                "time_limit_seconds": args.time_limit,
+                "timeout_grace_seconds": args.timeout_grace,
+                "collision_backend": args.collision_backend,
+                "resolution": args.resolution,
+                "top_level_trial_jobs": args.jobs,
+                "validation_instrumentation": False,
+                "arc_repair_seed_schedule": (
+                    "unique per outer trial, logical repair batch/task, and "
+                    "attempt; independent of worker slot"
+                ),
+                "parallel_arc_conflict_find_assignment": (
+                    DEFAULT_PARALLEL_ARC_CONFLICT_FIND_ASSIGNMENT
+                ),
+                "parallel_arc_local_or_multi_start": True,
+                "trial_process_group_cleanup_required": True,
+                "arc_profile_args": list(PANDA_ARC_PROFILE_ARGS),
+            },
+            indent=2,
+        ) + "\n"
+    )
     write_manifest(
         output_root,
         experiment_type="parallel_arc_optimistic_conflict_ablation_panda_cage_n8",

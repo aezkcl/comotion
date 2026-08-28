@@ -335,6 +335,28 @@ parseParallelArcConflictBatchMode(const std::string &value) {
         "Unknown ParallelARC conflict batch mode: " + value);
 }
 
+inline comotion::ConflictFindParallelAssignment
+parseParallelArcConflictFindAssignment(const std::string &value) {
+    std::string lowered = lowerAscii(value);
+    std::replace(lowered.begin(), lowered.end(), '-', '_');
+    if (lowered == "auto")
+        return comotion::ConflictFindParallelAssignment::Auto;
+    if (lowered == "pair_cover")
+        return comotion::ConflictFindParallelAssignment::PairCover;
+    if (lowered == "round_robin") {
+        return comotion::ConflictFindParallelAssignment::
+            AllRobotsRoundRobin;
+    }
+    if (lowered == "balanced_pair_cover")
+        return comotion::ConflictFindParallelAssignment::BalancedPairCover;
+    if (lowered == "pair_first_greedy")
+        return comotion::ConflictFindParallelAssignment::PairFirstGreedy;
+    if (lowered == "cyclic_cover_greedy")
+        return comotion::ConflictFindParallelAssignment::CyclicCoverGreedy;
+    throw std::runtime_error(
+        "Unknown ParallelARC conflict-find assignment: " + value);
+}
+
 template <typename Options>
 auto parallelArcConflictBatchModeValueImpl(const Options &options, int)
     -> decltype(options.parallel_arc_conflict_batch_mode) {
@@ -349,6 +371,22 @@ std::string parallelArcConflictBatchModeValueImpl(const Options &, long) {
 template <typename Options>
 std::string parallelArcConflictBatchModeValue(const Options &options) {
     return parallelArcConflictBatchModeValueImpl(options, 0);
+}
+
+template <typename Options>
+auto parallelArcConflictAblationOnlyValueImpl(const Options &options, int)
+    -> decltype(options.parallel_arc_conflict_ablation_only) {
+    return options.parallel_arc_conflict_ablation_only;
+}
+
+template <typename Options>
+bool parallelArcConflictAblationOnlyValueImpl(const Options &, long) {
+    return false;
+}
+
+template <typename Options>
+bool parallelArcConflictAblationOnlyValue(const Options &options) {
+    return parallelArcConflictAblationOnlyValueImpl(options, 0);
 }
 
 inline std::string normalizedVampValidationStrategyName(std::string value) {
@@ -396,6 +434,8 @@ vampValidationStrategyName(const comotion::VampValidationStrategy &strategy) {
 
 inline void applyVampValidationStrategy(comotion::CollisionChecker &checker,
                                         const std::string &value) {
+    if (checker.backend() != comotion::CollisionChecker::Backend::Vamp)
+        return;
     checker.setVampValidationStrategy(parseVampValidationStrategy(value));
 }
 
@@ -457,6 +497,167 @@ parseDrrtLocalConnectorMode(const std::string &value) {
     throw std::runtime_error("Unknown dRRT local connector mode: " + value);
 }
 
+template <typename Options>
+void validateSelectedPlannerOptions(const Options &options,
+                                    bool planning_requested = true) {
+    if (!planning_requested)
+        return;
+
+    if (options.collision_backend == comotion::CollisionChecker::Backend::Vamp)
+        (void)parseVampValidationStrategy(options.vamp_validation_strategy);
+
+    if (options.algorithm == "prioritized") {
+        if (options.strrt_initial_batch_size == 0)
+            throw std::runtime_error(
+                "--strrt-initial-batch-size must be at least 1");
+        if (options.strrt_initial_time_factor <= 1.0)
+            throw std::runtime_error(
+                "--strrt-initial-time-factor must be greater than 1.0");
+        if (options.strrt_time_bound_factor_increase <= 1.0)
+            throw std::runtime_error(
+                "--strrt-time-bound-factor-increase must be greater than 1.0");
+        (void)parseStrrtRewiring(options.strrt_rewiring);
+    }
+
+    const bool uses_drrt_options =
+        options.algorithm == "drrt" || options.algorithm == "drrt_star" ||
+        options.algorithm == "drrtstar" || options.algorithm == "ao_drrt" ||
+        options.algorithm == "ao-drrt";
+    if (uses_drrt_options) {
+        if (options.drrt_roadmap_size < 2)
+            throw std::runtime_error("--drrt-roadmap-size must be at least 2");
+        if (options.drrt_iterations_per_batch < 1)
+            throw std::runtime_error(
+                "--drrt-iterations-per-batch must be at least 1");
+        (void)parseDrrtCostMetric(options.drrt_cost_metric);
+        (void)parseDrrtTensorSearchMode(options.drrt_tensor_search);
+        (void)parseDrrtLocalConnectorMode(options.drrt_local_connector);
+    }
+
+    if (options.algorithm == "composite" &&
+        options.composite_rrt_range < 0.0) {
+        throw std::runtime_error("--composite-rrt-range must be non-negative");
+    }
+    if (options.algorithm == "composite_aorrtc") {
+        if (options.composite_aorrtc_max_internal_samples == 0)
+            throw std::runtime_error(
+                "--aorrtc-max-internal-samples must be at least 1");
+        if (options.composite_aorrtc_max_internal_vertices == 0)
+            throw std::runtime_error(
+                "--aorrtc-max-internal-vertices must be at least 1");
+    }
+    if (options.algorithm == "cooperative_composite" &&
+        options.cooperative_rrt_worker_threads == 0) {
+        throw std::runtime_error(
+            "--cooperative-rrt-worker-threads must be at least 1");
+    }
+
+    const bool uses_arc_options = options.algorithm == "arc" ||
+                                  options.algorithm == "ao_arc" ||
+                                  options.algorithm == "parallel_arc";
+    if (uses_arc_options) {
+        if (options.arc_initial_window < 1)
+            throw std::runtime_error("--arc-initial-window must be at least 1");
+        if (!std::isfinite(options.arc_expansion_step) ||
+            options.arc_expansion_step <= 0.0) {
+            throw std::runtime_error("--arc-expansion-step must be positive");
+        }
+        (void)parseArcExpansionPolicy(options.arc_expansion_policy);
+        (void)parseArcExpansionMultipliers(options.arc_expansion_multipliers);
+        if (options.arc_initial_valid_expansion_policy) {
+            (void)parseArcExpansionPolicy(
+                *options.arc_initial_valid_expansion_policy);
+        }
+        if (options.arc_initial_valid_expansion_step &&
+            (!std::isfinite(*options.arc_initial_valid_expansion_step) ||
+             *options.arc_initial_valid_expansion_step <= 0.0)) {
+            throw std::runtime_error(
+                "--arc-initial-valid-expansion-step must be positive");
+        }
+        if (options.arc_initial_valid_expansion_multipliers) {
+            (void)parseArcExpansionMultipliers(
+                *options.arc_initial_valid_expansion_multipliers);
+        }
+        if (!std::isfinite(options.arc_cspace_bound_margin) ||
+            options.arc_cspace_bound_margin < 0.0)
+            throw std::runtime_error(
+                "--arc-cspace-bound-margin must be non-negative");
+        if (!std::isfinite(options.arc_min_cspace_bound_range) ||
+            options.arc_min_cspace_bound_range < 0.0)
+            throw std::runtime_error(
+                "--arc-min-cspace-bound-range must be non-negative");
+        if (options.arc_local_composite_range < 0.0)
+            throw std::runtime_error(
+                "--arc-local-composite-range must be non-negative");
+        (void)parseArcLocalSolverMode(options.arc_local_solvers);
+        (void)parseStrrtRewiring(
+            options.arc_local_prioritized_rewiring);
+    }
+
+    if (options.or_parallel_worker_processes == 0)
+        throw std::runtime_error(
+            "--or-parallel-worker-processes must be at least 1");
+
+    if (options.algorithm == "parallel_arc") {
+        if (options.parallel_arc_worker_processes == 0)
+            throw std::runtime_error(
+                "--parallel-arc-worker-processes must be at least 1");
+        if (options.parallel_arc_strategy != "synchronous" &&
+            options.parallel_arc_strategy != "asynchronous") {
+            throw std::runtime_error("Unknown ParallelARC strategy: " +
+                                     options.parallel_arc_strategy);
+        }
+        if (options.parallel_arc_conflict_strategy != "greedy" &&
+            options.parallel_arc_conflict_strategy !=
+                "spatial_distribution") {
+            throw std::runtime_error(
+                "Unknown ParallelARC conflict strategy: " +
+                options.parallel_arc_conflict_strategy);
+        }
+        if (options.parallel_arc_conflict_find_mode != "sequential" &&
+            options.parallel_arc_conflict_find_mode != "segment_parallel") {
+            throw std::runtime_error(
+                "Unknown ParallelARC conflict-find mode: " +
+                options.parallel_arc_conflict_find_mode);
+        }
+        if (options.parallel_arc_conflict_find_mode == "segment_parallel") {
+            if (options.parallel_arc_conflict_find_horizon == 0) {
+                throw std::runtime_error(
+                    "--parallel-arc-conflict-find-horizon must be at least 1 "
+                    "for segment_parallel mode");
+            }
+            const auto assignment = parseParallelArcConflictFindAssignment(
+                options.parallel_arc_conflict_find_assignment);
+            if ((assignment ==
+                     comotion::ConflictFindParallelAssignment::PairFirstGreedy ||
+                 assignment == comotion::ConflictFindParallelAssignment::
+                                   CyclicCoverGreedy) &&
+                options.collision_backend !=
+                    comotion::CollisionChecker::Backend::Vamp) {
+                throw std::runtime_error(
+                    options.parallel_arc_conflict_find_assignment +
+                    " conflict assignment currently requires the VAMP "
+                    "collision backend");
+            }
+        }
+        (void)parseParallelArcConflictBatchMode(
+            parallelArcConflictBatchModeValue(options));
+        if (parallelArcConflictAblationOnlyValue(options) &&
+            options.or_parallel_worker_processes != 1) {
+            throw std::runtime_error(
+                "--parallel-arc-conflict-ablation-only does not support "
+                "outer OR parallelism");
+        }
+    }
+
+    if (options.algorithm == "stcbs") {
+        if (options.stcbs_max_ct_nodes < 1)
+            throw std::runtime_error("--stcbs-max-ct-nodes must be at least 1");
+        if (options.stcbs_max_samples < 1)
+            throw std::runtime_error("--stcbs-max-samples must be at least 1");
+    }
+}
+
 inline void writeJson(const json &doc, const std::filesystem::path &path,
                       int indent) {
     if (path.has_parent_path())
@@ -468,6 +669,134 @@ inline void writeJson(const json &doc, const std::filesystem::path &path,
         ofs << doc.dump(indent) << "\n";
     else
         ofs << doc.dump() << "\n";
+}
+
+inline bool arcHistoryRequested(bool output_paths, bool track_arc_history) {
+    return output_paths && track_arc_history;
+}
+
+inline void enableArcHistoryTracking(
+    const std::shared_ptr<comotion::MultiRobotPlanner> &planner,
+    bool output_paths, bool track_arc_history) {
+    if (const auto arc = std::dynamic_pointer_cast<comotion::ARC>(planner)) {
+        arc->setVisualizationTraceEnabled(
+            arcHistoryRequested(output_paths, track_arc_history));
+    }
+}
+
+inline const std::vector<comotion::Path> *arcHistoryArtifactPaths(
+    const std::shared_ptr<comotion::MultiRobotPlanner> &planner,
+    bool output_paths, bool track_arc_history) {
+    if (!arcHistoryRequested(output_paths, track_arc_history))
+        return nullptr;
+    const auto arc = std::dynamic_pointer_cast<comotion::ARC>(planner);
+    if (!arc || arc->visualizationTrace().empty())
+        return nullptr;
+    return &arc->visualizationTrace().back().paths;
+}
+
+inline json pathConfigsJson(const comotion::Path &path) {
+    json configs = json::array();
+    for (const auto &config : path)
+        configs.push_back(config);
+    return configs;
+}
+
+inline comotion::Path densePathForExport(const comotion::Path &path,
+                                         std::size_t resolution,
+                                         double vmax) {
+    comotion::Path dense = path;
+    if (dense.has_explicit_timesteps())
+        dense.interpolate_to_timesteps(resolution, vmax);
+    return dense;
+}
+
+inline std::vector<comotion::Path> densePathsForExport(
+    const std::vector<comotion::Path> &paths, std::size_t resolution,
+    double vmax) {
+    std::vector<comotion::Path> dense_paths;
+    dense_paths.reserve(paths.size());
+    for (const auto &path : paths)
+        dense_paths.push_back(densePathForExport(path, resolution, vmax));
+    return dense_paths;
+}
+
+inline void appendArcVisualization(
+    json &result,
+    const std::shared_ptr<comotion::MultiRobotPlanner> &planner,
+    bool output_paths, bool track_arc_history,
+    std::size_t resolution, double vmax) {
+    if (!arcHistoryRequested(output_paths, track_arc_history))
+        return;
+    const auto arc = std::dynamic_pointer_cast<comotion::ARC>(planner);
+    if (!arc || arc->visualizationTrace().empty())
+        return;
+
+    json trace = {
+        {"schema_version", "1.0"},
+        {"planner", arc->name()},
+        {"iterations", json::array()},
+    };
+    if (const auto parallel_arc =
+            std::dynamic_pointer_cast<comotion::ParallelARC>(planner)) {
+        trace["workers"] = std::max(1u, parallel_arc->workerProcesses());
+    } else {
+        trace["workers"] = 1;
+    }
+
+    for (const auto &iteration : arc->visualizationTrace()) {
+        json iteration_json = {
+            {"paths", json::array()},
+            {"timesteps", 0},
+            {"conflict_scan_completed", iteration.conflict_scan_completed},
+            {"conflicts", json::array()},
+            {"repairs", json::array()},
+        };
+        std::size_t timesteps = 0;
+        for (const auto &path : iteration.paths) {
+            const auto dense_path =
+                densePathForExport(path, resolution, vmax);
+            iteration_json["paths"].push_back(pathConfigsJson(dense_path));
+            timesteps = std::max(timesteps, dense_path.size());
+        }
+        iteration_json["timesteps"] = timesteps;
+
+        for (const auto &conflict : iteration.conflicts) {
+            iteration_json["conflicts"].push_back({
+                {"robot_i", conflict.seed_robot_i},
+                {"robot_j", conflict.seed_robot_j},
+                {"robots", conflict.robots},
+                {"timestep", conflict.conflict_timestep},
+                {"alpha", conflict.alpha},
+                {"kind", "vertex"},
+                {"window_start_t", conflict.window_begin_t},
+                {"window_end_t", conflict.window_end_t},
+            });
+        }
+
+        for (const auto &repair : iteration.repairs) {
+            json repair_json = {
+                {"conflict_index", repair.conflict_index},
+                {"robots", repair.robots},
+                {"window_start_t", repair.window_start_t},
+                {"window_end_t", repair.window_end_t},
+                {"paths", json::array()},
+            };
+            for (const auto &path : repair.local_paths) {
+                const auto dense_path =
+                    densePathForExport(path, resolution, vmax);
+                repair_json["paths"].push_back(pathConfigsJson(dense_path));
+            }
+            iteration_json["repairs"].push_back(std::move(repair_json));
+        }
+
+        trace["iterations"].push_back(std::move(iteration_json));
+    }
+
+    const auto &last = arc->visualizationTrace().back();
+    trace["solution_found"] =
+        last.conflict_scan_completed && last.conflicts.empty();
+    result["arc_visualization"] = std::move(trace);
 }
 
 inline std::string requireValue(int &index, int argc, char **argv,
@@ -686,6 +1015,27 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             auto planner = std::make_shared<comotion::AOARC>();
             planner->setInitialWindow(options.arc_initial_window);
             planner->setExpansionStep(options.arc_expansion_step);
+            planner->setExpansionPolicy(
+                parseArcExpansionPolicy(options.arc_expansion_policy));
+            planner->setCustomExpansionMultipliers(
+                parseArcExpansionMultipliers(
+                    options.arc_expansion_multipliers));
+            if (options.arc_initial_valid_expansion_policy) {
+                planner->setInitialValidWindowExpansionPolicy(
+                    parseArcExpansionPolicy(
+                        *options.arc_initial_valid_expansion_policy));
+            }
+            if (options.arc_initial_valid_expansion_step) {
+                planner->setInitialValidWindowExpansionStep(
+                    *options.arc_initial_valid_expansion_step);
+            }
+            if (options.arc_initial_valid_expansion_multipliers) {
+                planner->setInitialValidWindowExpansionMultipliers(
+                    parseArcExpansionMultipliers(
+                        *options.arc_initial_valid_expansion_multipliers));
+            }
+            planner->setInitialValidWindowExpansionSymmetric(
+                options.arc_initial_valid_expansion_symmetric);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
             planner->setLocalCompositeRrtRange(
@@ -696,6 +1046,12 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
                 parseArcLocalSolverMode(options.arc_local_solvers));
             planner->setLocalPrioritizedStrrtMaxIterations(
                 options.arc_local_prioritized_max_iterations);
+            planner->setLocalPrioritizedStrrtReturnFirstSolution(
+                options.arc_local_prioritized_return_first_solution);
+            planner->setLocalPrioritizedStrrtRewiring(parseStrrtRewiring(
+                options.arc_local_prioritized_rewiring));
+            planner->setLocalPrioritizedStrrtPersistAtGoal(
+                options.arc_local_prioritized_persist_at_goal);
             planner->setBoundedLocalRepairEpsilonTimesteps(
                 options.ao_arc_local_bound_epsilon_timesteps);
             planner->setSimplifyInitialSolutions(
@@ -801,6 +1157,12 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
                 parseArcLocalSolverMode(options.arc_local_solvers));
             planner->setLocalPrioritizedStrrtMaxIterations(
                 options.arc_local_prioritized_max_iterations);
+            planner->setLocalPrioritizedStrrtReturnFirstSolution(
+                options.arc_local_prioritized_return_first_solution);
+            planner->setLocalPrioritizedStrrtRewiring(parseStrrtRewiring(
+                options.arc_local_prioritized_rewiring));
+            planner->setLocalPrioritizedStrrtPersistAtGoal(
+                options.arc_local_prioritized_persist_at_goal);
             planner->setSimplifyInitialSolutions(
                 options.arc_simplify_initial_solutions);
             planner->setSimplifyConflictSolutions(
@@ -834,6 +1196,27 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             auto planner = std::make_shared<comotion::ParallelARC>();
             planner->setInitialWindow(options.arc_initial_window);
             planner->setExpansionStep(options.arc_expansion_step);
+            planner->setExpansionPolicy(
+                parseArcExpansionPolicy(options.arc_expansion_policy));
+            planner->setCustomExpansionMultipliers(
+                parseArcExpansionMultipliers(
+                    options.arc_expansion_multipliers));
+            if (options.arc_initial_valid_expansion_policy) {
+                planner->setInitialValidWindowExpansionPolicy(
+                    parseArcExpansionPolicy(
+                        *options.arc_initial_valid_expansion_policy));
+            }
+            if (options.arc_initial_valid_expansion_step) {
+                planner->setInitialValidWindowExpansionStep(
+                    *options.arc_initial_valid_expansion_step);
+            }
+            if (options.arc_initial_valid_expansion_multipliers) {
+                planner->setInitialValidWindowExpansionMultipliers(
+                    parseArcExpansionMultipliers(
+                        *options.arc_initial_valid_expansion_multipliers));
+            }
+            planner->setInitialValidWindowExpansionSymmetric(
+                options.arc_initial_valid_expansion_symmetric);
             planner->setLocalCompositeRrtMaxSamples(
                 options.arc_local_composite_max_samples);
             planner->setLocalCompositeRrtRange(
@@ -844,6 +1227,12 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
                 parseArcLocalSolverMode(options.arc_local_solvers));
             planner->setLocalPrioritizedStrrtMaxIterations(
                 options.arc_local_prioritized_max_iterations);
+            planner->setLocalPrioritizedStrrtReturnFirstSolution(
+                options.arc_local_prioritized_return_first_solution);
+            planner->setLocalPrioritizedStrrtRewiring(parseStrrtRewiring(
+                options.arc_local_prioritized_rewiring));
+            planner->setLocalPrioritizedStrrtPersistAtGoal(
+                options.arc_local_prioritized_persist_at_goal);
             planner->setSimplifyInitialSolutions(
                 options.arc_simplify_initial_solutions);
             planner->setSimplifyConflictSolutions(
@@ -909,6 +1298,9 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
             }
             planner->setConflictFindHorizon(
                 options.parallel_arc_conflict_find_horizon);
+            planner->setConflictFindParallelAssignment(
+                parseParallelArcConflictFindAssignment(
+                    options.parallel_arc_conflict_find_assignment));
             planner->setConflictBatchMode(parseParallelArcConflictBatchMode(
                 parallelArcConflictBatchModeValue(options)));
             return planner;

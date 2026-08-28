@@ -706,6 +706,10 @@ bool testArcSolutionMetricsMatchReturnedRaggedPaths() {
     comotion::ARC planner;
     planner.setProblem(problem);
     planner.setPlanningSeed(11);
+    planner.setVisualizationTraceEnabled(true);
+    planner.setLocalPrioritizedStrrtReturnFirstSolution(false);
+    planner.setLocalPrioritizedStrrtRewiring(comotion::StrrtRewiring::Radius);
+    planner.setLocalPrioritizedStrrtPersistAtGoal(true);
     planner.setInitialWindow(16);
     planner.setExpansionStep(16);
     comotion::PathSimplificationOptions simplification_options;
@@ -731,6 +735,14 @@ bool testArcSolutionMetricsMatchReturnedRaggedPaths() {
         return false;
 
     const auto paths = planner.getSolutionPaths();
+    if (!expectTrue(
+            "ARC visualization trace captures a conflict-free iteration",
+            planner.visualizationTrace().size() == 1 &&
+                planner.visualizationTrace().front().conflict_scan_completed &&
+                planner.visualizationTrace().front().conflicts.empty() &&
+                planner.visualizationTrace().front().paths.size() ==
+                    problem->numRobots()))
+        return false;
     std::uint64_t returned_sum = 0;
     std::uint64_t returned_makespan = 0;
     for (const auto &path : paths) {
@@ -792,6 +804,15 @@ bool testArcSolutionMetricsMatchReturnedRaggedPaths() {
         return false;
     if (!expectTrue("ARC initial window reported",
                     planner_stats["initial_window"].get<int>() == 16))
+        return false;
+    if (!expectTrue(
+            "ARC local PrioritizedSTRRT controls are reported",
+            !planner_stats["local_prioritized_strrt_return_first_solution"]
+                 .get<bool>() &&
+                planner_stats["local_prioritized_strrt_rewiring"]
+                        .get<std::string>() == "radius" &&
+                planner_stats["local_prioritized_strrt_persist_at_goal"]
+                    .get<bool>()))
         return false;
     if (!expectTrue("ARC expansion step reported",
                     planner_stats["expansion_step"].get<int>() == 16))
@@ -1327,6 +1348,61 @@ bool runLocalModeProbe(comotion::ARC::LocalSolverMode mode, bool &success) {
     return true;
 }
 
+bool testArcLocalRepairsUsePerSubproblemSeeds() {
+    auto problem = makeArcLocalModeProblem();
+    ArcHistoryProbe probe;
+    probe.setProblem(problem);
+    probe.setPlanningSeed(17);
+    probe.setLocalSolverMode(
+        comotion::ARC::LocalSolverMode::CompositeRrtOnly);
+    probe.setInitialWindow(1);
+    probe.setExpansionStep(1);
+    probe.setUseCspaceBounds(false);
+
+    for (int repair = 0; repair < 2; ++repair) {
+        comotion::Path path;
+        path.push_back(problem->robot(0).start);
+        path.push_back(problem->robot(0).goal);
+        path.waypoint_timesteps_ = {0, 1};
+        std::vector<comotion::Path> working_paths{path};
+        if (!expectTrue(
+                "seed telemetry local repair succeeds",
+                probe.solveProbeSubproblem(
+                    makeSingleRobotFullWindowConflict(), 2.0,
+                    working_paths))) {
+            return false;
+        }
+    }
+
+    const auto events = probe.repairAttemptEvents();
+    if (!expectEq("seed telemetry repair count", events.size(), 2))
+        return false;
+
+    std::uint32_t previous_root = 0;
+    std::uint32_t previous_composite = 0;
+    for (std::size_t index = 0; index < events.size(); ++index) {
+        const auto root =
+            events[index]["attempt_root_planning_seed"].get<std::uint32_t>();
+        const auto composite =
+            events[index]["composite_planning_seed"].get<std::uint32_t>();
+        if (!expectTrue(
+                "ARC invokes composite with its per-attempt derived seed",
+                composite ==
+                    comotion::arcRepairCompositePlanningSeed(root))) {
+            return false;
+        }
+        if (index > 0 &&
+            !expectTrue("separate ARC repairs use different root seeds",
+                        root != previous_root &&
+                            composite != previous_composite)) {
+            return false;
+        }
+        previous_root = root;
+        previous_composite = composite;
+    }
+    return true;
+}
+
 bool testArcLocalSolverModeGating() {
     bool success = false;
 
@@ -1383,6 +1459,8 @@ int main() {
     if (!testArcSplicesRaggedLocalPathsWithoutEqualizing())
         return 1;
     if (!testArcLocalSolverModeGating())
+        return 1;
+    if (!testArcLocalRepairsUsePerSubproblemSeeds())
         return 1;
 
     std::cout << "arc_exact_only_regression: OK\n";

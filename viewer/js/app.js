@@ -428,9 +428,66 @@ function applyCrossSectionCamera() {
 }
 
 function applyResultCamera(data) {
-  if (!applyStandardPandaCageCamera(data)) {
-    applyFittedResultCamera(data);
+  if (applyPandaFlatRobotCamera(data)) return;
+  if (applyStandardPandaCageCamera(data)) return;
+  applyFittedResultCamera(data);
+}
+
+/**
+ * Panda-flat metadata only contains robot base points, which can center the
+ * generic camera below the articulated links. Fit the camera to the loaded
+ * visual meshes after the initial joint configuration has been applied.
+ */
+function applyPandaFlatRobotCamera(data) {
+  if (data.benchmark?.context?.suite !== "panda_flat") return false;
+  if (!camera || !controls) return false;
+
+  const bounds = new THREE.Box3();
+  let found = false;
+  for (const entry of robotMeshes) {
+    const root = entry.urdfRobot || entry.collisionUrdfRobot || entry.mesh;
+    if (!root) continue;
+    root.updateMatrixWorld?.(true);
+    const robotBounds = new THREE.Box3().setFromObject(root);
+    if (robotBounds.isEmpty()) continue;
+    if (!found) bounds.copy(robotBounds);
+    else bounds.union(robotBounds);
+    found = true;
   }
+  if (!found) return false;
+
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = bounds.getSize(new THREE.Vector3());
+  const radius = Math.max(0.5, 0.5 * size.length());
+  const halfVerticalFov = THREE.MathUtils.degToRad(camera.fov * 0.5);
+  const halfHorizontalFov = Math.atan(
+    Math.tan(halfVerticalFov) * Math.max(camera.aspect, 1e-6)
+  );
+  const limitingHalfFov = Math.max(
+    THREE.MathUtils.degToRad(8),
+    Math.min(halfVerticalFov, halfHorizontalFov)
+  );
+  const dist = Math.max(2.2, (radius / Math.sin(limitingHalfFov)) * 1.18);
+  const direction = new THREE.Vector3(1, -1, 0.8).normalize();
+
+  camera.up.set(0, 0, 1);
+  controls.target.copy(center);
+  camera.position.copy(center).addScaledVector(direction, dist);
+  camera.lookAt(center);
+  updateCameraClipAndShadow(Math.max(size.x, size.y, size.z, 1), dist);
+  controls.update();
+  if (typeof controls.target0 !== "undefined") {
+    controls.target0.copy(controls.target);
+    controls.position0.copy(camera.position);
+    controls.up0.copy(camera.up);
+  }
+  syncCameraInputsFromOrbit();
+  console.log("[viewer] Fitted Panda-flat camera to loaded robot meshes", {
+    center: center.toArray(),
+    size: size.toArray(),
+    distance: dist,
+  });
+  return true;
 }
 
 function initCameraPanel() {
@@ -473,6 +530,14 @@ function poseToMatrix(pose) {
 function buildObstacles(data) {
   const group = new THREE.Group();
   const obstacleMat = new THREE.MeshLambertMaterial({ color: OBSTACLE_COLOR, side: THREE.DoubleSide });
+  const context = data.benchmark?.context;
+  const pandaFlatPlatformMat = new THREE.MeshLambertMaterial({
+    color: OBSTACLE_COLOR,
+    transparent: true,
+    opacity: 0.32,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
   let sphereCount = 0;
   let cylinderCount = 0;
 
@@ -495,7 +560,12 @@ function buildObstacles(data) {
       const halfHeight = obs.geometry?.half_height ?? 0.5;
       const height = 2 * halfHeight;
       const geom = new THREE.CylinderGeometry(r, r, height, 24);
-      const mesh = new THREE.Mesh(geom, obstacleMat);
+      const isPandaFlatPlatform =
+        context?.suite === "panda_flat" && data.obstacles.length === 1;
+      const mesh = new THREE.Mesh(
+        geom,
+        isPandaFlatPlatform ? pandaFlatPlatformMat : obstacleMat
+      );
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       const pos = obs.pose?.position || [0, 0, 0];
@@ -519,6 +589,67 @@ function buildObstacles(data) {
       cylinderCount++;
     }
   });
+
+  // Canonical heterogeneous tasks have no collision obstacles: the
+  // "corridor" is the bounded workspace through which the flying spheres
+  // travel between the two Panda rows. Draw that workspace as viewer-only
+  // geometry without changing the planning problem or verification result.
+  const corridor = context?.suite === "heterogeneous_corridor"
+    ? context.sphere_environment
+    : null;
+  const corridorMin = corridor?.min;
+  const corridorMax = corridor?.max;
+  if (
+    Array.isArray(corridorMin) && corridorMin.length >= 3 &&
+    Array.isArray(corridorMax) && corridorMax.length >= 3
+  ) {
+    const min = corridorMin.map(Number);
+    const max = corridorMax.map(Number);
+    if ([...min, ...max].every(Number.isFinite)) {
+      const length = Math.max(0.1, max[0] - min[0]);
+      const width = Math.max(0.1, max[1] - min[1]);
+      const height = Math.max(0.15, max[2] - min[2]);
+      const cx = 0.5 * (min[0] + max[0]);
+      const cy = 0.5 * (min[1] + max[1]);
+      const cz = 0.5 * (min[2] + max[2]);
+      const thickness = Math.max(0.025, Math.min(length, width) * 0.02);
+
+      const floorMaterial = new THREE.MeshLambertMaterial({
+        color: 0xdde4ec,
+        transparent: true,
+        opacity: 0.55,
+        side: THREE.DoubleSide,
+      });
+      const wallMaterial = new THREE.MeshLambertMaterial({
+        color: 0x7890a8,
+        transparent: true,
+        opacity: 0.38,
+        side: THREE.DoubleSide,
+      });
+
+      const floor = new THREE.Mesh(
+        new THREE.BoxGeometry(length, width, thickness),
+        floorMaterial
+      );
+      floor.name = "heterogeneous-corridor-floor";
+      floor.position.set(cx, cy, min[2] - 0.5 * thickness);
+      floor.receiveShadow = true;
+      group.add(floor);
+
+      for (const y of [min[1], max[1]]) {
+        const wall = new THREE.Mesh(
+          new THREE.BoxGeometry(length, thickness, height),
+          wallMaterial
+        );
+        wall.name = "heterogeneous-corridor-wall";
+        wall.position.set(cx, y, cz);
+        wall.castShadow = true;
+        wall.receiveShadow = true;
+        group.add(wall);
+      }
+      console.log("[viewer] Built heterogeneous corridor workspace", corridor);
+    }
+  }
 
   if (sphereCount > 0 || cylinderCount > 0) {
     console.log(`Built ${data.obstacles.length} obstacles (${sphereCount} spheres, ${cylinderCount} cylinders)`);
@@ -1619,6 +1750,14 @@ async function loadUrdfRobotWithSolidColor(assetBase, urdfUrl, colorHex) {
 async function loadResult(data) {
   resultData = data;
   currentTimestep = 0;
+
+  // Panda-flat scenes are compact and heavily overlapping. Prefer the
+  // spherized collision model on initial load: it uses built-in URDF sphere
+  // primitives, so it remains visible even on browsers that fail to render
+  // the Panda OBJ meshes. The geometry button can still switch to visuals.
+  showRobotCollisionGeometry =
+    data.benchmark?.context?.suite === "panda_flat";
+  syncGeometryToggleButton();
 
   clearCrossSection2DGroup();
   obstacleMeshes.forEach((m) => scene.remove(m));

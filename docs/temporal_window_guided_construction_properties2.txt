@@ -1,0 +1,66 @@
+Input: global robot set R, global C-space C, global query set Q
+
+P ← ∅
+
+for each robot r ∈ R:
+    p_r ← PlanIndividualPath(r, C, Q_r)
+
+    if no valid path found:
+        return failure
+
+    P ← P ∪ {p_r}
+
+conflict ← FindFirstConflict(P) #above while loop
+
+while global problem not solved:# fix find FFC before while, maybe put while conflict not empty etc.
+
+    conflict ← FindFirstConflict(P) #above while loop
+
+    if no conflict: 
+
+        return solution 
+
+    X ← ExtractConflictCharacteristics(conflict, P) 
+
+    H ← GetRepairHistory(conflict) 
+
+    R' ← PredictRobotSet(X, H, P) 
+
+    T ← PredictTemporalWindow(R, X, H, P) 
+
+    C' ← PredictCSpaceRegion(X, H, P, T) 
+
+    Qstart, Qgoal ← GenerateSubqueries(R',P, T)
+
+    createSubProblem(conflict, R', T, Qstart, Qgoal, C')
+
+
+createSubProblem(conflict, R', T, Qstart, Qgoal, C')
+
+    while conflict not resolved: 
+
+        S ← BuildSubproblem(R', T, Qstart, Qgoal, C')
+
+        success ← SolveSubproblem(S) 
+
+        if success: 
+
+            ApplyRepair()
+
+            P ← ApplyRepair(P, solution) 
+
+            UpdateHistory() 
+
+            Break 
+
+        πT ← SelectTemporalExpansionPolicy(X, H, S) 
+
+        T ← ExpandTemporalWindow(T, πT) 
+
+        Qstart, Qgoal ← GenerateSubqueries(R', T, P) 
+
+        C' ← GenerateCSpace(R', T) 
+
+        if temporal expansion limit reached:# fix this part somehow to account for robots in dependent conflicts
+
+            ApplyFallbackPolicy() 

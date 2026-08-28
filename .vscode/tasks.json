@@ -1,0 +1,25 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build remaining ARC demos",
+			"type": "shell",
+			"command": "${workspaceFolder}/.venv/bin/cmake",
+			"args": [
+				"--build",
+				"build",
+				"--target",
+				"planar_manipulator_cross",
+				"panda_cage",
+				"panda_flat",
+				"heterogeneous_corridor",
+				"-j2"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": "build"
+		}
+	]
+}

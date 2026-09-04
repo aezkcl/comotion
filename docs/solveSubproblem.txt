@@ -1,0 +1,41 @@
+Algorithm 4: SolveSubProblem
+
+Input:
+    MRMP_SubProblem
+    Selected conflict c
+    Set of MRMP solvers S
+
+Output:
+    Local resolution paths
+    Resolution attempt
+
+1:  local_paths ← ∅
+
+2:  for each solver s ∈ S do
+
+3:      local_paths ← SolveMRMP(
+            s,
+            MRMP_SubProblem)
+
+4:      if local_paths ≠ ∅ then
+
+5:          attempt ← {
+                conflict: c,
+                problem: MRMP_SubProblem,
+                solver: s,
+                outcome: SUCCESS
+            }
+
+6:          return local_paths, attempt
+
+7:      end if
+
+8:  end for
+
+9:  attempt ← {
+        conflict: c,
+        problem: MRMP_SubProblem,
+        outcome: FAILURE
+    }
+
+10: return ∅, attempt

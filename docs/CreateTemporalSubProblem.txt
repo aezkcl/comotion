@@ -1,0 +1,53 @@
+Algorithm 3a: CreateTemporalSubProblem
+
+Input:
+    Selected conflict c
+    Robot set R′
+    Conflict characteristics X
+    Paths
+    Global environment E
+    Resolved_conflicts
+    Resolution_attempts[c]
+
+Output:
+    Local environment E′
+    Local queries Q′
+
+1:  if Resolution_attempts[c] = ∅ then
+
+2:      T ← PredictTemporalWindow(
+            c,
+            R′,
+            X,
+            Resolved_conflicts,
+            Paths)
+
+3:  else
+
+4:      Sprev ← MostRecentAttempt(
+            Resolution_attempts[c])
+
+5:      if Sprev.TemporalWindow
+            reaches global temporal limit then
+
+6:          return ∅
+
+7:      end if
+
+8:      T ← ExpandTemporalWindow(
+            c,
+            R′,
+            X,
+            Resolved_conflicts,
+            Paths,
+            Sprev)
+
+9:  end if
+
+10: Q′ ← GenerateSubqueries(
+        R′, T, Paths, c)
+
+11: E′ ← GenerateCSpaceRegion(
+        R′, Q′, E)
+
+12: return E′, Q′

@@ -1,0 +1,62 @@
+Algorithm 1: ARC
+
+Input:
+    MRMP_Problem = {Environment, Robots, Queries}
+    selected_expansion_policy ∈ {CSPACE, TEMPORAL}
+
+Output:
+    Paths
+
+1:  Paths ← ∅
+2:  Resolved_conflicts ← ∅
+3:  Resolution_attempts ← ∅
+
+4:  for each robot ri with query qi in MRMP_Problem.Robots do
+
+5:      Pathi ← MotionPlanning(
+            MRMP_Problem.Environment,
+            {ri},
+            {qi})
+
+6:      Paths ← Paths ∪ {Pathi}
+
+7:  end for
+
+8:  c ← FindFirstConflict(Paths)
+
+9:  while c ≠ ∅ do
+
+10:     MRMP_SubProblem ← CreateSubProblem(
+            c,
+            Paths,
+            MRMP_Problem.Environment,
+            Resolved_conflicts,
+            Resolution_attempts[c],
+            selected_expansion_policy)
+
+11:     if MRMP_SubProblem = ∅ then
+12:         return ∅
+13:     end if
+
+14:     resolution_paths, resolution_attempt ←
+            SolveSubProblem(MRMP_SubProblem, c)
+
+15:     Resolution_attempts[c].append(
+            resolution_attempt)
+
+16:     if resolution_paths ≠ ∅ then
+
+17:         UpdateSolution(
+                Paths,
+                resolution_paths)
+
+18:         Resolved_conflicts.append(
+                Resolution_attempts[c])
+
+19:         c ← FindFirstConflict(Paths)
+
+20:     end if
+
+21: end while
+
+22: return Paths

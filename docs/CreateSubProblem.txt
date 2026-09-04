@@ -1,0 +1,54 @@
+Algorithm 2: CreateSubProblem
+
+Input:
+    Selected conflict c
+    Paths
+    Global environment E
+    Resolved_conflicts
+    Resolution_attempts[c]
+    selected_expansion_policy
+
+Output:
+    MRMP_SubProblem
+
+1:  X ← ExtractConflictCharacteristics(
+            c, Paths, E)
+
+2:  R′ ← PredictRobotSet(
+            c, X, Paths)
+
+3:  if selected_expansion_policy = CSPACE then
+
+4:      E′, Q′ ← CreateCSpaceSubProblem(
+            c,
+            R′,
+            X,
+            Paths,
+            E,
+            Resolved_conflicts,
+            Resolution_attempts[c])
+
+5:  else if selected_expansion_policy = TEMPORAL then
+
+6:      E′, Q′ ← CreateTemporalSubProblem(
+            c,
+            R′,
+            X,
+            Paths,
+            E,
+            Resolved_conflicts,
+            Resolution_attempts[c])
+
+7:  end if
+
+8:  if E′ = ∅ then
+9:      return ∅
+10: end if
+
+11: MRMP_SubProblem ← {
+        Environment: E′,
+        Robots: R′,
+        Queries: Q′
+    }
+
+12: return MRMP_SubProblem

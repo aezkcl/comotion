@@ -131,6 +131,12 @@ PANDA_RESOURCES = (
     "resources/panda/panda.srdf",
 )
 
+PLANAR_RESOURCES = (
+    "resources/planar3/planar3_spherized.urdf",
+    "resources/planar3/planar3.urdf",
+    "resources/planar3/planar3.srdf",
+)
+
 CASES = (
     Case(
         "mobile_circle_n4",
@@ -147,6 +153,60 @@ CASES = (
         ("--scenario", "circle", "--num-robots", "8"),
         MOBILE_PROFILE_ARGS,
         30.0,
+    ),
+    Case(
+        "planar_cross_n4",
+        "planar_cross",
+        "planar_manipulator_cross",
+        ("--scenario", "cross", "--num-robots", "4"),
+        HETEROGENEOUS_PROFILE_ARGS,
+        120.0,
+        PLANAR_RESOURCES,
+    ),
+    Case(
+        "planar_cross_n8",
+        "planar_cross",
+        "planar_manipulator_cross",
+        ("--scenario", "cross", "--num-robots", "8"),
+        HETEROGENEOUS_PROFILE_ARGS,
+        120.0,
+        PLANAR_RESOURCES,
+    ),
+    Case(
+        "panda_flat_n4",
+        "panda_flat",
+        "panda_flat",
+        ("--num-robots", "4", "--task-index", "0"),
+        HETEROGENEOUS_PROFILE_ARGS,
+        300.0,
+        PANDA_RESOURCES,
+    ),
+    Case(
+        "panda_flat_n8",
+        "panda_flat",
+        "panda_flat",
+        ("--num-robots", "8", "--task-index", "0"),
+        HETEROGENEOUS_PROFILE_ARGS,
+        300.0,
+        PANDA_RESOURCES,
+    ),
+    Case(
+        "panda_cage_n4",
+        "panda_cage",
+        "panda_cage",
+        ("--num-robots", "4", "--task-index", "0"),
+        HETEROGENEOUS_PROFILE_ARGS,
+        300.0,
+        PANDA_RESOURCES,
+    ),
+    Case(
+        "panda_cage_n8",
+        "panda_cage",
+        "panda_cage",
+        ("--num-robots", "8", "--task-index", "0"),
+        HETEROGENEOUS_PROFILE_ARGS,
+        300.0,
+        PANDA_RESOURCES,
     ),
     Case(
         "heterogeneous_p4_s8",
@@ -371,9 +431,14 @@ def trial_dir(output_root: Path, trial: Trial) -> Path:
     )
 
 
-def trial_command(build_dir: Path, output_root: Path, trial: Trial) -> list[str]:
+def trial_command(
+    build_dir: Path,
+    output_root: Path,
+    trial: Trial,
+    track_history: bool,
+) -> list[str]:
     directory = trial_dir(output_root, trial)
-    history_args = ["--track-arc-history"] if trial.seed == 0 else []
+    history_args = ["--track-arc-history"] if track_history else []
     return [
         str(build_dir / trial.case.executable),
         *trial.case.scenario_args,
@@ -524,6 +589,8 @@ def run_trial(
     output_root: Path,
     cpu: int | None,
     existing: str,
+    track_history: bool,
+    total_trials: int,
 ) -> dict[str, Any]:
     directory = trial_dir(output_root, trial)
     record_path = directory / "trial.json"
@@ -531,7 +598,10 @@ def run_trial(
         if existing == "skip":
             existing_record = read_json(record_path)
             if existing_record is not None:
-                print(f"[{trial.ordinal:02d}/80] skip {trial.trial_id}", flush=True)
+                print(
+                    f"[{trial.ordinal:02d}/{total_trials}] skip {trial.trial_id}",
+                    flush=True,
+                )
                 return existing_record
         elif existing == "error":
             raise RuntimeError(f"Trial record already exists: {record_path}")
@@ -539,9 +609,11 @@ def run_trial(
             shutil.rmtree(directory)
 
     directory.mkdir(parents=True, exist_ok=True)
-    command = trial_command(build_dir, output_root, trial)
+    command = trial_command(build_dir, output_root, trial, track_history)
     launch_command = pinned_command(command, cpu)
-    print(f"[{trial.ordinal:02d}/80] run {trial.trial_id}", flush=True)
+    print(
+        f"[{trial.ordinal:02d}/{total_trials}] run {trial.trial_id}", flush=True
+    )
 
     started_utc = utc_now()
     process_start = time.monotonic()
@@ -581,7 +653,7 @@ def run_trial(
         result=result,
         max_endpoint_error=max_endpoint_error,
     )
-    full_history_requested = trial.seed == 0
+    full_history_requested = track_history
     diagnostics = diagnostic_summary(
         metrics, result, full_history_requested
     )
@@ -762,6 +834,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow execution from a dirty Git worktree.",
     )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Do not embed full repair history for seed 0; final paths are still exported.",
+    )
     return parser.parse_args()
 
 
@@ -775,9 +852,6 @@ def main() -> int:
     expected_count = len(cases) * len(seeds) * len(VARIANTS)
     if len(trials) != expected_count or len({trial.trial_id for trial in trials}) != len(trials):
         raise RuntimeError("Trial matrix is incomplete or contains duplicates")
-    if cases == CASES and seeds == SEEDS and len(trials) != 80:
-        raise RuntimeError("The default pilot must contain exactly 80 trials")
-
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_root = args.output_root or (
         DEFAULT_RESULTS_DIR / f"guided_arc_policy_pilot_{timestamp}"
@@ -796,9 +870,12 @@ def main() -> int:
     print(f"output_root: {output_root}")
     print(f"cpu_affinity: {cpu}")
     for trial in trials:
+        track_history = trial.seed == 0 and not args.no_history
         print(
             f"[{trial.ordinal:02d}/{len(trials)}] {trial.trial_id}\n  "
-            + " ".join(trial_command(args.build_dir, output_root, trial))
+            + " ".join(
+                trial_command(args.build_dir, output_root, trial, track_history)
+            )
         )
     if not args.execute:
         return 0
@@ -824,7 +901,9 @@ def main() -> int:
         "serial_execution": True,
         "cpu_affinity": cpu,
         "timeout_grace_seconds": TIMEOUT_GRACE_SECONDS,
-        "full_history_seeds": [seed for seed in seeds if seed == 0],
+        "full_history_seeds": [
+            seed for seed in seeds if seed == 0 and not args.no_history
+        ],
         "seeds": list(seeds),
         "case_keys": [case.key for case in cases],
         "variant_keys": [variant.key for variant in VARIANTS],
@@ -875,6 +954,8 @@ def main() -> int:
             output_root=output_root,
             cpu=cpu,
             existing=args.existing,
+            track_history=trial.seed == 0 and not args.no_history,
+            total_trials=len(trials),
         )
         for trial in trials
     ]

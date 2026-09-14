@@ -65,6 +65,41 @@ bool ConflictChecker::validateCompositePaths(
     return cc_.validateCompositePaths(paths, robots, options);
 }
 
+bool ConflictChecker::visitInterRobotConflicts(
+    const std::vector<Path> &paths,
+    const std::vector<const RobotModel *> &robots,
+    const CompositePathValidationOptions &options,
+    const InterRobotConflictVisitor &visitor,
+    int min_timestep) const {
+    if (paths.size() != robots.size() || !visitor)
+        return false;
+
+    CompositePathValidationOptions scoped = options;
+    scoped.check_environment = false;
+    if (min_timestep > 0) {
+        scoped.t_begin =
+            std::max(scoped.t_begin, static_cast<std::size_t>(min_timestep));
+    }
+
+    bool interrupted = false;
+    const InterRobotConflictCallback observe_without_retaining =
+        [&](const CompositeConflict &conflict) {
+            if (scoped.stop_requested && scoped.stop_requested()) {
+                interrupted = true;
+            } else {
+                visitor(conflict);
+            }
+            return InterRobotConflictDecision{false, {}};
+        };
+
+    (void)cc_.findInterRobotPathConflictsCompositeScan(
+        paths, robots, scoped, 0, false, observe_without_retaining);
+
+    if (scoped.stop_requested && scoped.stop_requested())
+        interrupted = true;
+    return !interrupted;
+}
+
 std::optional<Conflict> ConflictChecker::findConflict(
     const std::vector<Path> &paths,
     const std::vector<const RobotModel *> &robots, int min_timestep,

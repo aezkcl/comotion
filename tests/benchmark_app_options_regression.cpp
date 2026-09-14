@@ -31,6 +31,7 @@ struct Options {
     std::size_t composite_aorrtc_max_internal_vertices = 0;
     unsigned int cooperative_rrt_worker_threads = 0;
 
+    std::string guided_arc_robot_selection = "arc_repair_history";
     int arc_initial_window = 1;
     double arc_expansion_step = 1.0;
     std::string arc_expansion_policy = "linear";
@@ -58,6 +59,8 @@ struct Options {
     int stcbs_max_samples = 0;
 };
 
+struct OptionsWithoutGuidedArcSelection {};
+
 bool expectNoThrow(const std::string &label,
                    const std::function<void()> &operation) {
     try {
@@ -84,6 +87,32 @@ bool expectThrow(const std::string &label,
 
 int main() {
     bool ok = true;
+
+    using RobotSelectionPolicy =
+        comotion::GuidedARC::RobotSelectionPolicy;
+
+    ok &= common::parseGuidedArcRobotSelectionPolicy(
+              "arc_repair_history") ==
+          RobotSelectionPolicy::ArcRepairHistory;
+    ok &= common::parseGuidedArcRobotSelectionPolicy(
+              "historical-direct-neighbors") ==
+          RobotSelectionPolicy::HistoricalDirectNeighbors;
+    ok &= common::guidedArcRobotSelectionPolicyName(
+              RobotSelectionPolicy::HistoricalDirectNeighbors) ==
+          "historical_direct_neighbors";
+    ok &= common::guidedArcRobotSelectionPolicyValue(
+              OptionsWithoutGuidedArcSelection{}) ==
+          "arc_repair_history";
+    ok &= expectThrow("invalid GuidedARC robot selection", []() {
+        (void)common::parseGuidedArcRobotSelectionPolicy("not_a_policy");
+    });
+
+    comotion::GuidedARC guided_arc;
+    guided_arc.setRobotSelectionPolicy(
+        common::parseGuidedArcRobotSelectionPolicy(
+            "historical_direct_neighbors"));
+    ok &= guided_arc.robotSelectionPolicy() ==
+          RobotSelectionPolicy::HistoricalDirectNeighbors;
 
     ok &= !common::arcHistoryRequested(false, false);
     ok &= !common::arcHistoryRequested(true, false);
@@ -130,6 +159,20 @@ int main() {
         common::validateSelectedPlannerOptions(options);
     });
 
+    options.guided_arc_robot_selection = "not_a_policy";
+    ok &= expectNoThrow("ARC with invalid GuidedARC robot selection", [&]() {
+        common::validateSelectedPlannerOptions(options);
+    });
+    options.algorithm = "temporal_guided_arc";
+    ok &= expectThrow("GuidedARC with invalid robot selection", [&]() {
+        common::validateSelectedPlannerOptions(options);
+    });
+    options.guided_arc_robot_selection = "historical_direct_neighbors";
+    ok &= expectNoThrow("GuidedARC with historical direct neighbors", [&]() {
+        common::validateSelectedPlannerOptions(options);
+    });
+
+    options.algorithm = "arc";
     options.collision_backend = comotion::CollisionChecker::Backend::Fcl;
     options.parallel_arc_conflict_find_assignment = "cyclic_cover_greedy";
     ok &= expectNoThrow("ARC/FCL with a VAMP-only ParallelARC assignment",

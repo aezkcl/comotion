@@ -2104,21 +2104,27 @@ ARC::repairWindowsForRobots(int robot_i, int robot_j) const {
     return &teammate_it->second;
 }
 
-SubproblemConflict ARC::expandConflictForSubproblem(
+SubproblemConflict ARC::makeInitialSubproblemConflict(
     const Conflict &conflict) const {
     SubproblemConflict expanded;
     expanded.conflict_timestep = conflict.timestep;
     expanded.window_begin_t = std::max(0, conflict.timestep - initial_window_);
     expanded.window_end_t = conflict.timestep + initial_window_;
-    expanded.robots = subproblemRobotsForConflict(
-        conflict.robot_i, conflict.robot_j, expanded.window_begin_t,
-        expanded.window_end_t, &expanded.expansion_trace);
     expanded.seed_robot_i = conflict.robot_i;
     expanded.seed_robot_j = conflict.robot_j;
     expanded.alpha = conflict.alpha;
     expanded.kind = conflict.kind;
     expanded.config_i = conflict.config_i;
     expanded.config_j = conflict.config_j;
+    return expanded;
+}
+
+SubproblemConflict ARC::expandConflictForSubproblem(
+    const Conflict &conflict) const {
+    auto expanded = makeInitialSubproblemConflict(conflict);
+    expanded.robots = subproblemRobotsForConflict(
+        conflict.robot_i, conflict.robot_j, expanded.window_begin_t,
+        expanded.window_end_t, &expanded.expansion_trace);
     return expanded;
 }
 

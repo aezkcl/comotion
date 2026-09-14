@@ -79,6 +79,7 @@ struct AppOptions {
     std::size_t composite_aorrtc_max_internal_samples = 10000;
     std::size_t composite_aorrtc_max_internal_vertices = 10000;
     unsigned int cooperative_rrt_worker_threads = 2;
+    std::string guided_arc_robot_selection = "arc_repair_history";
     int arc_initial_window = 100;
     double arc_expansion_step = 1.05;
     std::string arc_expansion_policy = "exponential";
@@ -373,6 +374,8 @@ void writePathArtifacts(const TrialMetrics &metrics,
     json out;
     out["schema_version"] = "1.0";
     out["solver"] = metrics.planner;
+    out["planner_status"] = metrics.planner_status;
+    out["success"] = metrics.success;
     out["drrt_local_connector"] =
         common::drrtLocalConnectorSummary(metrics);
     out["collision_backend"] = metrics.collision_backend;
@@ -449,6 +452,8 @@ void writePathArtifacts(const TrialMetrics &metrics,
     common::appendArcVisualization(out, planner, output_paths,
                                    track_arc_history, problem->resolution(),
                                    problem->vmax());
+    common::appendGuidedArcResolutionHistory(
+        out, planner, output_paths, track_arc_history);
 
     writeJson(out, output_dir / (basename + "_" + metrics.planner + "_result.json"),
               2);
@@ -610,7 +615,7 @@ void printUsage(const char *prog) {
         << "  --scenario <name>       cross or adaptive (default: cross)\n"
         << "  --algorithm <name>      composite, composite_rrtstar, composite_prmstar, composite_aorrtc, "
         << "cooperative_composite, prioritized, drrt, drrt_star, ao_drrt, arc, ao_arc, "
-        << "parallel_arc, stcbs (default: arc)\n"
+        << "parallel_arc, temporal_guided_arc, stcbs (default: arc)\n"
         << "  --collision-backend <b> sphere, fcl, vamp (default: vamp)\n"
         << "  --vamp-validation-strategy <s> combined_rake, combined_linear,\n"
         << "                         hierarchical_rake, hierarchical_linear\n"
@@ -644,6 +649,8 @@ void printUsage(const char *prog) {
         << "  --drrt-local-connector <prioritized|synchronized> (default: prioritized)\n"
         << "  --drrt-exclude-roadmap-build-time\n"
         << "                         Give dRRT tensor search the full time limit after PRM* build\n"
+        << "  --guided-arc-robot-selection <arc_repair_history|historical_direct_neighbors|current_conflict_component>\n"
+        << "                         GuidedARC robot selection (default: arc_repair_history)\n"
         << "  --arc-initial-window <n> (default: 100)\n"
         << "  --arc-expansion-step <x> (default: 1.05)\n"
         << "  --arc-expansion-policy <linear|logarithmic|exponential|multiplied> (baseline ARC only; default: exponential)\n"
@@ -799,6 +806,9 @@ AppOptions parseArgs(int argc, char **argv) {
             options.cooperative_rrt_worker_threads =
                 static_cast<unsigned int>(
                     std::stoul(requireValue(i, argc, argv, arg)));
+        } else if (arg == "--guided-arc-robot-selection") {
+            options.guided_arc_robot_selection =
+                requireValue(i, argc, argv, arg);
         } else if (arg == "--arc-initial-window") {
             options.arc_initial_window =
                 std::stoi(requireValue(i, argc, argv, arg));

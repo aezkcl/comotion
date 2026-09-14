@@ -9,12 +9,12 @@ The implementation should support:
 - a history of resolved conflicts,
 - a history of resolution attempts for unresolved conflicts,
 - one `CreateSubProblem` function,
-- two subproblem construction/expansion modes:
-  - `CSPACE`
-  - `TEMPORAL`
+- two subproblem modes: `CSPACE` and `TEMPORAL`,
+- three implemented robot-selection policies: `ARC_REPAIR_HISTORY`,
+    `HISTORICAL_DIRECT_NEIGHBORS`, and `CURRENT_CONFLICT_COMPONENT`,
 - existing ARC feasibility solvers through `SolveSubProblem`.
 
-More sophisticated history-guided or learned policies are outside the scope of this implementation.
+Learned policies remain outside the scope of this implementation.
 
 ---
 
@@ -63,6 +63,37 @@ Resolved_conflicts.append(
     Resolution_attempts[c]
 )
 
+## Encountered Direct-Conflict History
+
+For `HISTORICAL_DIRECT_NEIGHBORS`, `Encountered_conflicts` is initialized empty
+for each `solve()` call. Each undirected robot pair stores the compact range
+covering every collision encountered for that pair:
+
+Encountered_conflicts[i][j] = {
+    earliest_t,
+    latest_t
+}
+
+A vertex collision at timestep `t` covers `[t, t]`. A segment collision with
+`alpha > 0` covers `[t, t + 1]`. The current selected conflict is recorded only
+after its robot set and initial temporal window have been computed, so selection
+uses previously encountered conflicts only.
+
+## Current Conflict Snapshot
+
+For `CURRENT_CONFLICT_COMPONENT`, every inter-robot collision in the current
+solution is streamed from timestep zero. The first collision retains its full
+configuration data as the selected conflict. All collisions contribute only an
+undirected edge and a compact covered-timestep range to `Current_conflicts`:
+
+Current_conflicts[i][j] = {
+    earliest_t,
+    latest_t
+}
+
+The snapshot is complete only when the entire scan finishes. An interrupted or
+cancelled scan is not used for robot selection.
+
 ---
 
 # Algorithm 1: ARC
@@ -70,6 +101,12 @@ Resolved_conflicts.append(
 Input:
     MRMP_Problem
     selected_expansion_policy ∈ {CSPACE, TEMPORAL}
+    selected_robot_policy ∈ {
+        ARC_REPAIR_HISTORY,
+        HISTORICAL_DIRECT_NEIGHBORS,
+        CURRENT_CONFLICT_COMPONENT
+    }
+    initial_window
 
 Output:
     Paths
@@ -77,6 +114,7 @@ Output:
 P ← ∅
 Resolved_conflicts ← ∅
 Resolution_attempts ← ∅
+Encountered_conflicts ← ∅
 
 for each robot ri with query qi in MRMP_Problem.Robots do
 
@@ -89,7 +127,15 @@ for each robot ri with query qi in MRMP_Problem.Robots do
 
 end for
 
-c ← FindFirstConflict(P)
+if selected_robot_policy = CURRENT_CONFLICT_COMPONENT then
+    c, Current_conflicts, complete ← StreamCurrentConflicts(P, start_t = 0)
+    if not complete then
+        return TIMEOUT
+    end if
+else
+    c ← FindFirstConflict(P)
+    Current_conflicts ← ∅
+end if
 
 while c ≠ ∅ do
 
@@ -99,7 +145,17 @@ while c ≠ ∅ do
         MRMP_Problem.Environment,
         Resolved_conflicts,
         Resolution_attempts[c],
-        selected_expansion_policy)
+        selected_expansion_policy,
+        selected_robot_policy,
+        Encountered_conflicts,
+        Current_conflicts,
+        initial_window)
+
+    if selected_robot_policy = HISTORICAL_DIRECT_NEIGHBORS then
+        RecordDirectConflict(
+            Encountered_conflicts,
+            c)
+    end if
 
     if MRMP_SubProblem = ∅ then
         return ∅
@@ -122,7 +178,15 @@ while c ≠ ∅ do
         Resolved_conflicts.append(
             Resolution_attempts[c])
 
-        c ← FindFirstConflict(P)
+        if selected_robot_policy = CURRENT_CONFLICT_COMPONENT then
+            c, Current_conflicts, complete ←
+                StreamCurrentConflicts(P, start_t = 0)
+            if not complete then
+                return TIMEOUT
+            end if
+        else
+            c ← FindFirstConflict(P)
+        end if
 
     end if
 
@@ -141,6 +205,10 @@ Input:
     Resolved_conflicts
     Resolution_attempts[c]
     selected_expansion_policy
+    selected_robot_policy
+    Encountered_conflicts
+    Current_conflicts
+    initial_window
 
 Output:
     MRMP_SubProblem
@@ -150,10 +218,15 @@ X ← ExtractConflictCharacteristics(
     P,
     E)
 
-R′ ← PredictRobotSet(
+R′, Tpolicy ← SelectRobotSet(
     c,
     X,
-    P)
+    P,
+    Resolved_conflicts,
+    selected_robot_policy,
+    Encountered_conflicts,
+    Current_conflicts,
+    initial_window)
 
 if selected_expansion_policy = CSPACE then
 
@@ -175,7 +248,8 @@ else if selected_expansion_policy = TEMPORAL then
         P,
         E,
         Resolved_conflicts,
-        Resolution_attempts[c])
+        Resolution_attempts[c],
+        Tpolicy)
 
 end if
 
@@ -193,6 +267,90 @@ return MRMP_SubProblem
 
 ---
 
+# Algorithm 2a: SelectRobotSet
+
+Input:
+    Selected conflict c = (i, j, t, alpha)
+    Conflict characteristics X
+    Paths P
+    Resolved_conflicts
+    selected_robot_policy
+    Encountered_conflicts
+    Current_conflicts
+    initial_window
+
+Output:
+    Robot set R′
+    Optional policy temporal window Tpolicy
+
+if selected_robot_policy = ARC_REPAIR_HISTORY then
+
+    R′ ← ARCRepairHistoryClosure(
+        c,
+        X,
+        P,
+        Resolved_conflicts)
+
+    return R′, ∅
+
+else if selected_robot_policy = HISTORICAL_DIRECT_NEIGHBORS then
+
+    R′ ← {i, j}
+    earliest_t, latest_t ← CoveredTimesteps(t, alpha)
+
+    for each r in {i, j} do
+        for each neighbor k and range [first_t, last_t]
+            in Encountered_conflicts[r] do
+
+            R′ ← R′ ∪ {k}
+            earliest_t ← min(earliest_t, first_t)
+            latest_t ← max(latest_t, last_t)
+
+        end for
+    end for
+
+    Tpolicy ← [
+        max(0, earliest_t - initial_window),
+        latest_t + initial_window
+    ]
+
+    return R′, Tpolicy
+
+else if selected_robot_policy = CURRENT_CONFLICT_COMPONENT then
+
+    R′ ← ConnectedComponent(
+        Current_conflicts,
+        seed_vertices = {i, j})
+
+    earliest_t, latest_t ← CoveredTimesteps(t, alpha)
+
+    for each edge (u, v) with range [first_t, last_t]
+        in Current_conflicts do
+
+        if u ∈ R′ and v ∈ R′ then
+            earliest_t ← min(earliest_t, first_t)
+            latest_t ← max(latest_t, last_t)
+        end if
+
+    end for
+
+    Tpolicy ← [
+        max(0, earliest_t - initial_window),
+        latest_t + initial_window
+    ]
+
+    return R′, Tpolicy
+
+end if
+
+Only adjacency entries for `i` and `j` are inspected. Neighbors added to `R′`
+are not traversed by `HISTORICAL_DIRECT_NEIGHBORS`, so that policy does not
+compute a transitive component. `CURRENT_CONFLICT_COMPONENT` does traverse the
+current graph transitively and covers every collision edge inside the selected
+component.
+
+---
+
 # Algorithm 3a: CreateTemporalSubProblem
 
 Input:
@@ -203,6 +361,7 @@ Input:
     Global environment E
     Resolved_conflicts
     Resolution_attempts[c]
+    Optional policy temporal window Tpolicy
 
 Output:
     Local environment E′
@@ -210,12 +369,16 @@ Output:
 
 if Resolution_attempts[c] = ∅ then
 
-    T ← PredictTemporalWindow(
-        c,
-        R′,
-        X,
-        Resolved_conflicts,
-        P)
+    if Tpolicy ≠ ∅ then
+        T ← ClipToGlobalPathHorizon(Tpolicy, P)
+    else
+        T ← PredictTemporalWindow(
+            c,
+            R′,
+            X,
+            Resolved_conflicts,
+            P)
+    end if
 
 else
 

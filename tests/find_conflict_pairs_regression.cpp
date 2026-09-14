@@ -111,6 +111,67 @@ bool testAllPairsAndCap() {
             capped[1].conflict_timestep == 10);
 }
 
+bool testVisitInterRobotConflicts() {
+    constexpr std::size_t kLength = 4;
+    std::vector<std::shared_ptr<comotion::RobotModel>> robots{
+        makeSphereRobot(),
+        makeSphereRobot(),
+    };
+    std::vector<comotion::Path> paths{
+        makeConstantPath(kLength, {0.0, 0.0, 0.0}),
+        makeConstantPath(kLength, {0.0, 0.0, 0.0}),
+    };
+    std::vector<const comotion::RobotModel *> ptrs{
+        robots[0].get(),
+        robots[1].get(),
+    };
+
+    comotion::CollisionChecker collision_checker(
+        comotion::CollisionChecker::Backend::Spheres);
+    comotion::ConflictChecker checker(collision_checker);
+    comotion::CompositePathValidationOptions options;
+
+    std::vector<std::size_t> visited_timesteps;
+    const bool complete = checker.visitInterRobotConflicts(
+        paths, ptrs, options,
+        [&](const comotion::CompositeConflict &conflict) {
+            visited_timesteps.push_back(conflict.timestep);
+        });
+    if (!expectTrue("visitor scan completes", complete) ||
+        !expectTrue("visitor streams every repeated collision",
+                    visited_timesteps ==
+                        std::vector<std::size_t>({0, 1, 2, 3}))) {
+        return false;
+    }
+
+    visited_timesteps.clear();
+    const bool suffix_complete = checker.visitInterRobotConflicts(
+        paths, ptrs, options,
+        [&](const comotion::CompositeConflict &conflict) {
+            visited_timesteps.push_back(conflict.timestep);
+        },
+        2);
+    if (!expectTrue("minimum-timestep visitor scan completes",
+                    suffix_complete) ||
+        !expectTrue("minimum-timestep visitor skips earlier collisions",
+                    visited_timesteps ==
+                        std::vector<std::size_t>({2, 3}))) {
+        return false;
+    }
+
+    options.stop_requested = []() { return true; };
+    std::size_t cancelled_visits = 0;
+    const bool cancelled_complete = checker.visitInterRobotConflicts(
+        paths, ptrs, options,
+        [&](const comotion::CompositeConflict &) {
+            ++cancelled_visits;
+        });
+    return expectTrue("cancelled visitor scan is incomplete",
+                      !cancelled_complete) &&
+           expectTrue("cancelled visitor suppresses callbacks",
+                      cancelled_visits == 0);
+}
+
 bool testUniqueKeepsNonOverlappingRobotSets() {
     constexpr std::size_t kLength = 32;
     std::vector<std::shared_ptr<comotion::RobotModel>> robots;
@@ -947,6 +1008,8 @@ bool testVampSegmentParallelFindConflictsMatchesSequential() {
 } // namespace
 
 int main() {
+    if (!testVisitInterRobotConflicts())
+        return 1;
     if (!testAllPairsAndCap())
         return 1;
     if (!testUniqueKeepsNonOverlappingRobotSets())

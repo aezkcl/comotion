@@ -74,6 +74,8 @@ class ConflictChecker {
 public:
     using ConflictExpansionFn =
         std::function<SubproblemConflict(const Conflict &)>;
+    using InterRobotConflictVisitor =
+        std::function<void(const CompositeConflict &)>;
 
     explicit ConflictChecker(const CollisionChecker &cc) : cc_(cc) {}
 
@@ -89,6 +91,15 @@ public:
         const std::vector<Path> &paths,
         const std::vector<const RobotModel *> &robots,
         const CompositePathValidationOptions &options = {}) const;
+
+    // Visit every robot-robot conflict without retaining conflict records.
+    // Returns true only when the complete requested horizon was scanned.
+    bool visitInterRobotConflicts(
+        const std::vector<Path> &paths,
+        const std::vector<const RobotModel *> &robots,
+        const CompositePathValidationOptions &options,
+        const InterRobotConflictVisitor &visitor,
+        int min_timestep = 0) const;
 
     // Find the first conflict across all paths, iterating native timestep/path
     // indices across all paths simultaneously. Shorter paths are treated as

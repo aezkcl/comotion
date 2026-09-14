@@ -52,6 +52,7 @@ The following headers are intentionally not installed:
 
 - `OrParallelPlanner`
 - `CooperativeCompositeRRT`
+- `GuidedARC`
 - `MakespanCompositeStateSpace`
 - `MakespanInformedSampler`
 - Any header under a `detail/` directory
@@ -59,3 +60,14 @@ The following headers are intentionally not installed:
 Source-only internals may still be used by CoMotion's own apps, benchmarks, and
 tests, but downstream projects should not include them from an installed
 package.
+
+`GuidedARC` exposes `setRobotSelectionPolicy()` and
+`robotSelectionPolicy()` for repository applications. `ArcRepairHistory` is
+the default and preserves ARC's repair-team history closure.
+`HistoricalDirectNeighbors` adds only robots that previously collided directly
+with either robot in the selected conflict; its temporal window covers those
+direct-edge collision times before applying the configured padding.
+`CurrentConflictComponent` scans the current solution from timestep zero and
+adds every robot in the conflict-graph component containing the selected pair.
+Its temporal window covers all current collisions in that component before
+applying the configured padding; an interrupted scan is treated as incomplete.

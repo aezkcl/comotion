@@ -174,6 +174,12 @@ if(COMOTION_BUILD_TESTS)
     add_test(NAME arc_exact_only_regression
              COMMAND arc_exact_only_regression)
 
+    add_executable(guided_arc_temporal_expansion_regression
+        tests/guided_arc_temporal_expansion_regression.cpp)
+    target_link_libraries(guided_arc_temporal_expansion_regression PRIVATE comotion)
+    add_test(NAME guided_arc_temporal_expansion_regression
+             COMMAND guided_arc_temporal_expansion_regression)
+
     add_executable(aorrtc_makespan_regression
         tests/aorrtc_makespan_regression.cpp)
     target_link_libraries(aorrtc_makespan_regression PRIVATE comotion)

@@ -3,6 +3,7 @@
 #include "comotion/collision/CollisionChecker.h"
 #include "comotion/planning/AOARC.h"
 #include "comotion/planning/ARC.h"
+#include "comotion/planning/GuidedARC.h"
 #include "comotion/planning/CompositeAORRTC.h"
 #include "comotion/planning/CompositePRMStar.h"
 #include "comotion/planning/CompositeRRT.h"
@@ -318,6 +319,57 @@ inline bool parseBoolValue(const std::string &value) {
     throw std::runtime_error("Expected boolean value, got: " + value);
 }
 
+inline comotion::GuidedARC::RobotSelectionPolicy
+parseGuidedArcRobotSelectionPolicy(const std::string &value) {
+    std::string normalized = lowerAscii(value);
+    std::replace(normalized.begin(), normalized.end(), '-', '_');
+    if (normalized == "arc_repair_history")
+        return comotion::GuidedARC::RobotSelectionPolicy::ArcRepairHistory;
+    if (normalized == "historical_direct_neighbors") {
+        return comotion::GuidedARC::RobotSelectionPolicy::
+            HistoricalDirectNeighbors;
+    }
+    if (normalized == "current_conflict_component") {
+        return comotion::GuidedARC::RobotSelectionPolicy::
+            CurrentConflictComponent;
+    }
+    throw std::runtime_error(
+        "Unknown GuidedARC robot selection policy: " + value +
+        " (expected arc_repair_history, historical_direct_neighbors, or "
+        "current_conflict_component)");
+}
+
+inline std::string guidedArcRobotSelectionPolicyName(
+    comotion::GuidedARC::RobotSelectionPolicy policy) {
+    switch (policy) {
+    case comotion::GuidedARC::RobotSelectionPolicy::ArcRepairHistory:
+        return "arc_repair_history";
+    case comotion::GuidedARC::RobotSelectionPolicy::
+        HistoricalDirectNeighbors:
+        return "historical_direct_neighbors";
+    case comotion::GuidedARC::RobotSelectionPolicy::
+        CurrentConflictComponent:
+        return "current_conflict_component";
+    }
+    throw std::logic_error("Unknown GuidedARC robot selection policy");
+}
+
+template <typename Options>
+auto guidedArcRobotSelectionPolicyValueImpl(const Options &options, int)
+    -> decltype(options.guided_arc_robot_selection) {
+    return options.guided_arc_robot_selection;
+}
+
+template <typename Options>
+std::string guidedArcRobotSelectionPolicyValueImpl(const Options &, long) {
+    return "arc_repair_history";
+}
+
+template <typename Options>
+std::string guidedArcRobotSelectionPolicyValue(const Options &options) {
+    return guidedArcRobotSelectionPolicyValueImpl(options, 0);
+}
+
 inline comotion::InterRobotConflictBatchMode
 parseParallelArcConflictBatchMode(const std::string &value) {
     const std::string lowered = lowerAscii(value);
@@ -552,9 +604,11 @@ void validateSelectedPlannerOptions(const Options &options,
             "--cooperative-rrt-worker-threads must be at least 1");
     }
 
-    const bool uses_arc_options = options.algorithm == "arc" ||
-                                  options.algorithm == "ao_arc" ||
-                                  options.algorithm == "parallel_arc";
+    const bool uses_arc_options =
+        options.algorithm == "arc" ||
+        options.algorithm == "ao_arc" ||
+        options.algorithm == "parallel_arc" ||
+        options.algorithm == "temporal_guided_arc";
     if (uses_arc_options) {
         if (options.arc_initial_window < 1)
             throw std::runtime_error("--arc-initial-window must be at least 1");
@@ -592,6 +646,10 @@ void validateSelectedPlannerOptions(const Options &options,
         (void)parseArcLocalSolverMode(options.arc_local_solvers);
         (void)parseStrrtRewiring(
             options.arc_local_prioritized_rewiring);
+        if (options.algorithm == "temporal_guided_arc") {
+            (void)parseGuidedArcRobotSelectionPolicy(
+                guidedArcRobotSelectionPolicyValue(options));
+        }
     }
 
     if (options.or_parallel_worker_processes == 0)
@@ -797,6 +855,98 @@ inline void appendArcVisualization(
     trace["solution_found"] =
         last.conflict_scan_completed && last.conflicts.empty();
     result["arc_visualization"] = std::move(trace);
+}
+
+inline std::string
+guidedArcResolutionSolverName(comotion::ResolutionSolver solver) {
+    switch (solver) {
+    case comotion::ResolutionSolver::None:
+        return "none";
+    case comotion::ResolutionSolver::PrioritizedSTRRT:
+        return "prioritized_strrt";
+    case comotion::ResolutionSolver::CompositeRRT:
+        return "composite_rrt";
+    }
+
+    throw std::logic_error(
+        "Unknown GuidedARC resolution solver");
+}
+
+inline std::string
+guidedArcResolutionOutcomeName(comotion::ResolutionOutcome outcome) {
+    switch (outcome) {
+    case comotion::ResolutionOutcome::Success:
+        return "success";
+    case comotion::ResolutionOutcome::Failure:
+        return "failure";
+    }
+
+    throw std::logic_error(
+        "Unknown GuidedARC resolution outcome");
+}
+
+inline void appendGuidedArcResolutionHistory(
+    json &result,
+    const std::shared_ptr<comotion::MultiRobotPlanner> &planner,
+    bool output_paths,
+    bool track_arc_history) {
+    if (!arcHistoryRequested(output_paths, track_arc_history))
+        return;
+
+    const auto guided_arc =
+        std::dynamic_pointer_cast<comotion::GuidedARC>(planner);
+    if (!guided_arc)
+        return;
+
+    json conflicts_json = json::array();
+
+    for (const auto &resolution :
+         guided_arc->resolvedConflicts().conflicts) {
+        json attempts_json = json::array();
+
+        for (const auto &attempt : resolution.attempts) {
+            if (!attempt.subproblem) {
+                throw std::logic_error(
+                    "GuidedARC resolution attempt has no subproblem");
+            }
+
+            const auto &subproblem = *attempt.subproblem;
+            attempts_json.push_back({
+                {"attempt_index", attempt.attempt_index},
+                {"attempt_root_seed", attempt.attempt_root_seed},
+                {"solver",
+                 guidedArcResolutionSolverName(attempt.solver)},
+                {"outcome",
+                 guidedArcResolutionOutcomeName(attempt.outcome)},
+                {"robots", subproblem.global_robot_indices},
+                {"window_start_t", subproblem.window_start_t},
+                {"window_end_t", subproblem.window_end_t},
+                {"global_end_t", subproblem.global_end_t},
+                {"spans_global_time",
+                 subproblem.spansGlobalTime()},
+                {"uses_global_cspace",
+                 subproblem.uses_global_cspace},
+            });
+        }
+
+        conflicts_json.push_back({
+            {"robot_i", resolution.conflict.robot_i},
+            {"robot_j", resolution.conflict.robot_j},
+            {"timestep", resolution.conflict.timestep},
+            {"alpha", resolution.conflict.alpha},
+            {"attempts", std::move(attempts_json)},
+        });
+    }
+
+    result["guided_arc_resolution_history"] = {
+        {"schema_version", "1.0"},
+        {"robot_selection_policy",
+         guidedArcRobotSelectionPolicyName(
+             guided_arc->robotSelectionPolicy())},
+        {"resolved_conflict_count",
+         guided_arc->resolvedConflicts().size()},
+        {"conflicts", std::move(conflicts_json)},
+    };
 }
 
 inline std::string requireValue(int &index, int argc, char **argv,
@@ -1184,6 +1334,90 @@ PlannerBlueprint makePlannerBlueprint(const Options &options,
                      options.arc_conflict_simplification_max_smooth_steps,
                      options.arc_conflict_simplification_max_passes});
             }
+            return planner;
+        };
+        return blueprint;
+    }
+
+    if (options.algorithm == "temporal_guided_arc") {
+        PlannerBlueprint blueprint;
+        blueprint.planner_name = "GuidedARC";
+        blueprint.factory = [&options]() {
+            auto planner = std::make_shared<comotion::GuidedARC>();
+
+            planner->setSubproblemExpansionMode(
+                comotion::GuidedARC::SubproblemExpansionMode::Temporal);
+            planner->setRobotSelectionPolicy(
+                parseGuidedArcRobotSelectionPolicy(
+                    guidedArcRobotSelectionPolicyValue(options)));
+            planner->setInitialWindow(options.arc_initial_window);
+            planner->setExpansionStep(options.arc_expansion_step);
+            planner->setExpansionPolicy(
+                parseArcExpansionPolicy(options.arc_expansion_policy));
+            planner->setCustomExpansionMultipliers(
+                parseArcExpansionMultipliers(
+                    options.arc_expansion_multipliers));
+
+            if (options.arc_initial_valid_expansion_policy) {
+                planner->setInitialValidWindowExpansionPolicy(
+                    parseArcExpansionPolicy(
+                        *options.arc_initial_valid_expansion_policy));
+            }
+
+            if (options.arc_initial_valid_expansion_step) {
+                planner->setInitialValidWindowExpansionStep(
+                    *options.arc_initial_valid_expansion_step);
+            }
+
+            if (options.arc_initial_valid_expansion_multipliers) {
+                planner->setInitialValidWindowExpansionMultipliers(
+                    parseArcExpansionMultipliers(
+                        *options.arc_initial_valid_expansion_multipliers));
+            }
+
+            planner->setInitialValidWindowExpansionSymmetric(
+                options.arc_initial_valid_expansion_symmetric);
+            planner->setLocalCompositeRrtMaxSamples(
+                options.arc_local_composite_max_samples);
+            planner->setLocalCompositeRrtRange(
+                options.arc_local_composite_range);
+            planner->setLocalCompositeRrtUseMakespanMetric(
+                options.arc_local_composite_use_makespan_metric);
+            planner->setLocalSolverMode(
+                parseArcLocalSolverMode(options.arc_local_solvers));
+            planner->setLocalPrioritizedStrrtMaxIterations(
+                options.arc_local_prioritized_max_iterations);
+            planner->setLocalPrioritizedStrrtReturnFirstSolution(
+                options.arc_local_prioritized_return_first_solution);
+            planner->setLocalPrioritizedStrrtRewiring(
+                parseStrrtRewiring(
+                    options.arc_local_prioritized_rewiring));
+            planner->setLocalPrioritizedStrrtPersistAtGoal(
+                options.arc_local_prioritized_persist_at_goal);
+            planner->setSimplifyInitialSolutions(
+                options.arc_simplify_initial_solutions);
+            planner->setSimplifyConflictSolutions(
+                options.arc_simplify_conflict_solutions);
+            planner->setUseCspaceBounds(true);
+            planner->setCspaceBoundMargin(
+                static_cast<float>(
+                    options.arc_cspace_bound_margin));
+            planner->setMinCspaceBoundRange(
+                options.arc_min_cspace_bound_range);
+            planner->setPathSimplificationOptions(
+                {options.arc_simplification_max_shortcut_steps,
+                 options.arc_simplification_max_empty_steps,
+                 options.arc_simplification_max_smooth_steps,
+                 options.arc_simplification_max_passes});
+
+            if (options.arc_conflict_simplification_options_explicit) {
+                planner->setConflictPathSimplificationOptions(
+                    {options.arc_conflict_simplification_max_shortcut_steps,
+                     options.arc_conflict_simplification_max_empty_steps,
+                     options.arc_conflict_simplification_max_smooth_steps,
+                     options.arc_conflict_simplification_max_passes});
+            }
+
             return planner;
         };
         return blueprint;

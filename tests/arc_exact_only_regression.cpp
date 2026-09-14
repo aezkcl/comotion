@@ -23,7 +23,7 @@ namespace {
 
 class ArcHistoryProbe : public comotion::ARC {
 public:
-    using ExpansionState = ExpansionScheduleState;
+    using ExpansionState = comotion::ExpansionScheduleState;
 
     void recordHistory(const std::vector<int> &robots, int window_start_t,
                        int window_end_t) {

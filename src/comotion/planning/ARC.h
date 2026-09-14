@@ -1,6 +1,7 @@
 #pragma once
 
 #include "comotion/collision/ConflictChecker.h"
+#include "comotion/planning/ExpansionScheduleState.h"
 #include "comotion/planning/MultiRobotPlanner.h"
 #include "comotion/planning/PathSimplification.h"
 #include "comotion/planning/PrioritizedSTRRT.h"
@@ -344,18 +345,6 @@ protected:
         std::vector<Path> local_patch_paths;
     };
 
-    struct ExpansionScheduleState {
-        bool initial_valid_window_established = false;
-        bool last_expansion_used_initial_valid_schedule = false;
-        std::size_t initial_valid_expansion_index = 0;
-        std::size_t main_expansion_index = 0;
-        bool initial_search_geometry_initialized = false;
-        std::int64_t initial_search_center_twice = 0;
-        std::int64_t initial_search_half_width_twice = 0;
-        std::int64_t main_window_center_twice = 0;
-        std::int64_t main_base_half_width_twice = 0;
-    };
-
     enum class RepairAttemptPhase {
         InitialWindow,
         InitialValid,
@@ -540,6 +529,9 @@ protected:
     appliedRepairHistoryEvents() const {
         return applied_repair_history_events_;
     }
+
+    SubproblemConflict
+    makeInitialSubproblemConflict(const Conflict &conflict) const;
 
     virtual SubproblemConflict
     expandConflictForSubproblem(const Conflict &conflict) const;

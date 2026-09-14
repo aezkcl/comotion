@@ -106,6 +106,7 @@ set(COMOTION_PUBLIC_HEADERS
   comotion/planning/AOARC.h
   comotion/planning/AORRTCUtils.h
   comotion/planning/ARC.h
+  comotion/planning/ExpansionScheduleState.h
   comotion/planning/CompositeAORRTC.h
   comotion/planning/CompositePRMStar.h
   comotion/planning/CompositeRRT.h
